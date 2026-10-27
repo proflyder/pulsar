@@ -339,12 +339,19 @@ impl Controller {
         let Some(first) = ids.into_iter().next() else {
             return;
         };
+        if !matches!(first.as_str(), "alisa" | "yandex" | "ricardo") {
+            return;
+        }
         if first == self.st.wake_word {
             return;
         }
         self.st.wake_word = first;
         info!("wake word -> {}", self.st.wake_word);
-        self.mic.set_model(model_dir(&self.st.wake_word));
+        let custom = self.st.wake_word == "ricardo";
+        self.mic.set_custom_wake(custom);
+        if !custom {
+            self.mic.set_model(model_dir(&self.st.wake_word));
+        }
         self.api
             .set_active_wake_words(vec![self.st.wake_word.clone()]);
         self.persist();

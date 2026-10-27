@@ -1,10 +1,11 @@
 //! Runs the microphone front-end without the daemon (stop the service first: the capture device
 //! has one user) and prints its events, plus once a second: VQE chunks, audio chunks, music
 //! frames, the captured rate and how far the processing thread is behind (FIFO).
-//! usage: frontend_probe [seconds=30] [--wake alisa|yandex] [--stream] [--music] [--commands]
+//! usage: frontend_probe [seconds=30] [--wake alisa|yandex|ricardo] [--stream] [--music] [--commands]
 //!                       [--record <wav> <seconds>]
 //! Without --commands only the wake word spotter runs (the daemon runs the command spotter too,
-//! unless the microphone is muted). --record writes the first <seconds> of the raw capture (all
+//! unless the microphone is muted). --wake ricardo uses the on-device model in
+//! /data/pulsar/wakewords. --record writes the first <seconds> of the raw capture (all
 //! channels, S16) as a WAV for ww_offline. No sound is played.
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -22,7 +23,8 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 const MODELS: &str = "/system/vendor/quasar/spotter_models/activation/";
 const COMMAND_MODEL: &str = "/system/vendor/quasar/spotter_models/command";
-const USAGE: &str = "usage: frontend_probe [seconds=30] [--wake alisa|yandex] [--stream] [--music] [--commands] [--record <wav> <seconds>]";
+const RICARDO_MODEL: &str = "/data/pulsar/wakewords/ru_ricardo_mww.tflite";
+const USAGE: &str = "usage: frontend_probe [seconds=30] [--wake alisa|yandex|ricardo] [--stream] [--music] [--commands] [--record <wav> <seconds>]";
 
 macro_rules! out {
     ($($arg:tt)*) => {{
@@ -59,7 +61,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--wake" => match it.next().as_deref() {
-                Some(w @ ("alisa" | "yandex")) => a.wake = w.into(),
+                Some(w @ ("alisa" | "yandex" | "ricardo")) => a.wake = w.into(),
                 other => return Err(format!("bad --wake: {}", other.unwrap_or(""))),
             },
             "--stream" => a.stream = true,
@@ -210,9 +212,13 @@ async fn run(m: &'static Model, a: Args) -> std::io::Result<bool> {
         Some((path, secs)) => Some(Recorder::create(path, m, secs)?),
         None => None,
     };
+    let custom = a.wake == "ricardo";
+    let native = if custom { "alisa" } else { &a.wake };
     let (h, mut rx) = pulsar_audio::spawn(
         m,
-        PathBuf::from(format!("{MODELS}{}", a.wake)),
+        PathBuf::from(format!("{MODELS}{native}")),
+        custom.then(|| PathBuf::from(RICARDO_MODEL)),
+        custom,
         Some(PathBuf::from(COMMAND_MODEL)),
     );
     h.set_commands(a.commands);
@@ -239,9 +245,17 @@ async fn run(m: &'static Model, a: Args) -> std::io::Result<bool> {
         tokio::select! {
             () = &mut end => break,
             ev = rx.recv() => match ev {
-                Some(FrontendEvent::Wake { phrase, level_db }) => {
+                Some(FrontendEvent::Wake {
+                    phrase,
+                    level_db,
+                    audio,
+                }) => {
                     wakes += 1;
-                    out!("t={:6.2}s WAKE '{phrase}' level {level_db:.1} dB", secs(start));
+                    out!(
+                        "t={:6.2}s WAKE '{phrase}' level {level_db:.1} dB pre-roll {} samples",
+                        secs(start),
+                        audio.len()
+                    );
                 }
                 Some(FrontendEvent::Command { word }) => {
                     commands += 1;
@@ -356,6 +370,8 @@ mod tests {
             (20, "yandex", true, true, true)
         );
         assert_eq!(a.record, Some((PathBuf::from("/tmp/x.wav"), 5)));
+        let a = args("--wake ricardo").unwrap();
+        assert_eq!(a.wake, "ricardo");
         assert!(args("--wake bob").is_err());
         assert!(args("0").is_err());
         assert!(args("10 20").is_err());

@@ -84,10 +84,11 @@ impl Default for Settings {
             clock_brightness: 1.0,
             clock_scroll_ms: 400,
             light: LightState::default(),
-            wake_word: "alisa".into(),
+            wake_word: "ricardo".into(),
             tz: "MSK-3".into(),
             auto_update: false,
-            nearest_answers: true,
+            // One station in this installation: the 250 ms arbitration window only adds latency.
+            nearest_answers: false,
             music_viz: "All styles".into(),
             clock_music: "Off".into(),
             led_speed: 1.0,

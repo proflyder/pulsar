@@ -32,7 +32,12 @@ use logic::{HaTimer, Phase, RunBinding};
 
 const MODELS: &str = "/system/vendor/quasar/spotter_models/activation/";
 const COMMAND_MODEL: &str = "/system/vendor/quasar/spotter_models/command";
+const RICARDO_MODEL: &str = "/data/pulsar/wakewords/ru_ricardo_mww.tflite";
 const SOUNDS: &str = "/system/vendor/quasar/sounds/";
+
+/// The Ricardo installation uses the station only as an ESPHome/Sendspin endpoint;
+/// the Yandex Zigbee radio stays untouched (the HA Zigbee coordinator is elsewhere).
+const ENABLE_ZIGBEE: bool = false;
 
 const DUCK_GAIN: f32 = 0.15;
 const TIMER_RING_MAX_MS: i64 = 15 * 60 * 1000;
@@ -42,9 +47,10 @@ const TIMER_RING_MAX_MS: i64 = 15 * 60 * 1000;
 // starts), and conversation agents (LLMs with tool calls) may think for a minute or more.
 const LISTEN_TIMEOUT_MS: u64 = 30_000;
 const PROCESS_TIMEOUT_MS: u64 = 120_000;
-// Updates: releases of this repository on GitHub. The first check waits for the network after
-// boot; an automatic install waits until the speaker is idle (it restarts the daemon).
-const UPDATE_REPO: &str = "Morvex885/pulsar";
+// Updates: releases of this fork on GitHub, never upstream. The first check waits for the
+// network after boot; auto_update stays off by default, so a custom binary is not replaced
+// silently.
+const UPDATE_REPO: &str = "proflyder/pulsar";
 const UPDATE_FIRST_CHECK_MS: u64 = 60_000;
 const UPDATE_CHECK_PERIOD_MS: u64 = 6 * 3_600_000;
 const UPDATE_IDLE_RETRY_MS: u64 = 10 * 60_000;
@@ -169,7 +175,6 @@ pub struct Controller {
     arb_phrase: String,
     arb_level: f32,
     arb_audio: Vec<i16>,
-    arb_command: String,
     /// Another station answers the wake word just heard.
     commands_blocked_until_ms: i64,
     run: RunBinding,
@@ -247,7 +252,11 @@ fn clock_face_index(name: &str) -> i32 {
 }
 
 fn model_dir(id: &str) -> PathBuf {
-    PathBuf::from(format!("{MODELS}{id}"))
+    if id == "ricardo" {
+        PathBuf::from(RICARDO_MODEL)
+    } else {
+        PathBuf::from(format!("{MODELS}{id}"))
+    }
 }
 
 /// C++ `uint8_t(x * 255)`.
@@ -290,8 +299,8 @@ impl Controller {
             VERSION,
             BUILD_TIME,
         );
-        if st.wake_word != "alisa" && st.wake_word != "yandex" {
-            st.wake_word = "alisa".into();
+        if st.wake_word != "alisa" && st.wake_word != "yandex" && st.wake_word != "ricardo" {
+            st.wake_word = "ricardo".into();
         }
         let case_colors = pulsar_hw::case_colors();
         let dir = logic::state_dir(state_path.as_os_str());
@@ -310,6 +319,11 @@ impl Controller {
                     phrase: "Яндекс".into(),
                     languages: vec!["ru".into()],
                 },
+                WakeWordInfo {
+                    id: "ricardo".into(),
+                    phrase: "Рикардо".into(),
+                    languages: vec!["ru".into()],
+                },
             ],
             active_wake_words: vec![st.wake_word.clone()],
             light_effects: strings(pulsar_hw::effect_names()),
@@ -317,7 +331,7 @@ impl Controller {
             music_styles: strings(pulsar_hw::music_styles()),
             case_colors: with_none(case_colors.clone()),
             clock_music_styles: strings(pulsar_clock::music_styles()),
-            zigbee_modes: if model.zigbee_tty.is_empty() {
+            zigbee_modes: if !ENABLE_ZIGBEE || model.zigbee_tty.is_empty() {
                 Vec::new()
             } else {
                 pulsar_zigbee::ROLES
@@ -423,9 +437,17 @@ impl Controller {
         } else {
             None
         };
+        let custom_wake = st.wake_word == "ricardo";
         let (mic, mic_rx) = pulsar_audio::spawn(
             model,
-            model_dir(&st.wake_word),
+            if custom_wake {
+                // Native spotters stay available for a rollback to «Алиса»/«Яндекс».
+                model_dir("alisa")
+            } else {
+                model_dir(&st.wake_word)
+            },
+            Some(PathBuf::from(RICARDO_MODEL)),
+            custom_wake,
             Some(PathBuf::from(COMMAND_MODEL)),
         );
 
@@ -480,7 +502,7 @@ impl Controller {
             None
         };
 
-        let (zigbee, zigbee_rx) = if model.zigbee_tty.is_empty() {
+        let (zigbee, zigbee_rx) = if !ENABLE_ZIGBEE || model.zigbee_tty.is_empty() {
             (None, None)
         } else {
             let zcfg = ZigbeeConfig {
@@ -559,7 +581,6 @@ impl Controller {
             arb_phrase: String::new(),
             arb_level: -100.0,
             arb_audio: Vec::new(),
-            arb_command: String::new(),
             commands_blocked_until_ms: 0,
             run: RunBinding::default(),
             stop_sent: false,
@@ -745,8 +766,12 @@ impl Controller {
 
     fn on_frontend(&mut self, ev: FrontendEvent) {
         match ev {
-            FrontendEvent::Wake { phrase, level_db } => self.on_wake(&phrase, level_db),
-            FrontendEvent::Command { word } => self.on_command(&word, false),
+            FrontendEvent::Wake {
+                phrase,
+                level_db,
+                audio,
+            } => self.on_wake(&phrase, level_db, audio),
+            FrontendEvent::Command { word } => self.on_command(&word),
             FrontendEvent::Audio(pcm) => {
                 if self.phase == Phase::Listening {
                     self.api.voice_send_audio(pcm);

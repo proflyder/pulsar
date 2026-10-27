@@ -150,6 +150,12 @@ func deployFiles(s, bin, arch string, zigbee bool) (changed, supChanged, ok bool
 		_ = shTo(os.Stdout, s, "sync")
 	}
 
+	// The Ricardo detector is a separate model, not part of the daemon binary.
+	// A checkout without satellite/wakewords keeps whatever is installed.
+	if !deployWakeModels(s) {
+		return
+	}
+
 	if zigbee && (!deployRadioImage(s, "zigbee-coordinator.ybl") || !deployRadioImage(s, "zigbee-router.ybl")) {
 		return
 	}
@@ -173,6 +179,58 @@ func deployFiles(s, bin, arch string, zigbee bool) (changed, supChanged, ok bool
 		_ = shTo(os.Stdout, s, "pidof dropbear >/dev/null || /data/dropbear/start.sh </dev/null >/dev/null 2>&1 &")
 	}
 	return changed, supChanged, true
+}
+
+// deployWakeModels copies every *.tflite from satellite/wakewords to
+// /data/pulsar/wakewords. The model is deliberately not part of the public
+// source tree: a release or checkout that does not contain it keeps the
+// installed model, and a fresh install without one logs the missing Ricardo
+// detector instead of failing the whole daemon.
+func deployWakeModels(s string) bool {
+	dir := filepath.Join(root, "satellite", "wakewords")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fmt.Println("satellite/wakewords missing: no wake-word model copied")
+		return true
+	}
+	found := false
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".tflite" {
+			continue
+		}
+		found = true
+		src := filepath.Join(dir, e.Name())
+		dst := dataDir + "/wakewords/" + e.Name()
+		want := sha256File(src)
+		if want == "" {
+			fmt.Fprintf(os.Stderr, "%s: cannot read %s\n", s, src)
+			return false
+		}
+		have, _ := sh(s, "[ -f "+dst+" ] && sha256sum "+dst)
+		if firstField(have) == want {
+			continue
+		}
+		if shTo(os.Stdout, s, "mkdir -p "+dataDir+"/wakewords") != nil {
+			return false
+		}
+		if push(s, src, dst+".new") != nil {
+			return false
+		}
+		got, _ := sh(s, "sha256sum "+dst+".new")
+		if firstField(got) != want {
+			_ = shTo(os.Stdout, s, "rm -f "+dst+".new")
+			fmt.Fprintf(os.Stderr, "%s: wake model push corrupted (sha256 mismatch)\n", s)
+			return false
+		}
+		if shTo(os.Stdout, s, "chmod 644 "+dst+".new && mv "+dst+".new "+dst+" && sync") != nil {
+			return false
+		}
+		fmt.Printf("wake model %s copied\n", e.Name())
+	}
+	if !found {
+		fmt.Println("satellite/wakewords has no *.tflite: no wake-word model copied")
+	}
+	return true
 }
 
 // deployRadioImage copies one of pulsar's radio firmware images, read by the daemon only when the

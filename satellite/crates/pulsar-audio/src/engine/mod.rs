@@ -11,6 +11,8 @@ use std::path::Path;
 
 use log::{error, info, warn};
 
+use crate::ricardo::RicardoWake;
+
 pub use ffi::{Lib, LoadError, Spotter, SpotterConf, Vqe, VqeStep, preload_deps};
 
 pub const VQE_MODELS: &str = "/system/vendor/quasar/vqe_models";
@@ -229,6 +231,9 @@ pub(crate) struct Engine {
     // config), as the C++ engine's destructor freed them.
     wake: Slot,
     cmd: Slot,
+    /// Optional on-device Ricardo detector. It is fed by the frontend instead of
+    /// the native spotter while the Ricardo wake word is active.
+    custom: Option<RicardoWake>,
     vqe: Vqe,
     lib: Lib,
     /// Capture frames per VQE chunk.
@@ -243,6 +248,7 @@ impl Engine {
     pub fn start(
         model: &pulsar_core::model::Model,
         wake_dir: &Path,
+        custom_wake_model: Option<&Path>,
         command_dir: Option<&Path>,
     ) -> Option<Engine> {
         if let Err(e) = preload_deps() {
@@ -281,9 +287,20 @@ impl Engine {
             return None;
         };
         info!("VQE '{preset}': {chunk} input frames -> {frame} output samples per chunk");
+        let custom = custom_wake_model.map(|path| match RicardoWake::new(path) {
+            Ok(detector) => {
+                info!("Ricardo wake word: {}", path.display());
+                Some(detector)
+            }
+            Err(e) => {
+                error!("Ricardo wake word: {e}");
+                None
+            }
+        });
         let mut eng = Engine {
             wake: Slot::new("wake word"),
             cmd: Slot::new("command"),
+            custom: custom.flatten(),
             vqe,
             lib,
             chunk: chunk_n,
@@ -324,6 +341,12 @@ impl Engine {
     /// Feeds the last chunk to the wake word spotter; its confirmed phrases.
     pub fn feed_wake(&mut self) -> Vec<String> {
         feed(&self.vqe, self.frame, &mut self.wake)
+    }
+
+    /// Feeds one VQE-cleaned chunk to the optional Ricardo detector.
+    /// None: no detector was loaded.
+    pub fn feed_custom(&mut self, pcm: &[i16]) -> Option<Result<(bool, f32), String>> {
+        self.custom.as_mut().map(|detector| detector.feed(pcm))
     }
 
     /// Feeds the last chunk to the command spotter; its confirmed phrases.

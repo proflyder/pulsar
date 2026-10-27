@@ -307,6 +307,12 @@ println!("cargo:rustc-link-lib=c++");
 - Ошибка dlopen / VQE / спотера логируется, handle деградированный (событий нет). PCM, который не
   открылся, не считается ошибкой старта: поток захвата пишет ошибку и повторяет открытие каждые
   2 с. Потоки останавливаются в `Drop` последнего клона handle.
+- `ricardo/` — C++ bridge к тому же microWakeWord, что и в C++-сборке: вендоренный
+  microfrontend, `libtflite.so` с Yandex FULL resolver, модель
+  `/data/pulsar/wakewords/ru_ricardo_mww.tflite`. Rust-сторона (`src/ricardo.rs`)
+  владеет только opaque handle; `frontend` хранит 0.5 с pre-roll и отправляет его
+  вместе с `FrontendEvent::Wake`. Без модели или `libtflite.so` детектор
+  логирует ошибку и не даёт wake-событий; остальной фронтенд не падает.
 - `stats()` / `set_raw_tap()` — только для `frontend_probe`: счётчики потоков и сырой захват для
   `--record`.
 

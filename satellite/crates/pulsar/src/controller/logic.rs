@@ -237,13 +237,6 @@ pub fn command_of(word: &str) -> Option<VoiceCommand> {
     })
 }
 
-/// Within the window after the wake word that opened this dialog: HA may end the speech of a
-/// short "Алиса, громче" (PROCESSING) before the command spotter confirms the word.
-pub fn after_wake(phase: Phase, now: i64, listen_started_ms: i64) -> bool {
-    matches!(phase, Phase::Listening | Phase::Processing)
-        && now - listen_started_ms < COMMAND_AFTER_WAKE_MS
-}
-
 /// Music of this station: playing or loading on the HA media channel or as a Sendspin stream, or
 /// paused / ended less than PAUSED_MUSIC_MS ago (Sendspin: its server still connected).
 /// `*_since`: when the media channel paused / the Sendspin stream ended; None = not since start.

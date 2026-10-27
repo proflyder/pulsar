@@ -11,6 +11,10 @@
 > колонке контроллер часов (i2c 0-003f) не поднимается,
 > сущностей часов нет; если ядро найдёт панель, демон подхватит её при старте (не проверялось).
 
+> **Ricardo fork:** этот checkout — отдельный Rust-профиль для нашей Midi,
+> ещё не установленный на колонку. Отличия, сборка и границы приёмки —
+> [`RICARDO.md`](RICARDO.md).
+
 Вместо штатного стека Яндекса (`maind`) на колонке работает небольшой нативный демон. Он говорит с
 Home Assistant по протоколу ESPHome Native API и выглядит в HA как обычное ESPHome-устройство.
 Для [Music Assistant](https://music-assistant.io/) он дополнительно является нативным
@@ -402,9 +406,10 @@ pulsar отдаёт модуль по протоколу deCONZ (ConBee/RaspBee)
   (aarch64/glibc 2.36 — обычный userspace Миди; 32-битный armhf/glibc 2.30 — Лайт 2, Мини 2 и
   образы Миди с 32-битным userspace). zig 0.13 не подходит: собранные им 32-битные программы
   падают при запуске. Другой zig можно указать как `ZIG=/путь/к/zig`;
-- `make`, `git`, `curl`, `patch`, компилятор C для хоста (`cc`), а для библиотеки Sendspin
-  (sendspin-cpp, единственная C++-часть сборки) — `cmake` ≥ 3.16 и `ninja`
-  (их можно поставить через `uv tool install cmake ninja`);
+- `make`, `git`, `curl`, `patch`, компилятор C/C++ для хоста (`cc`/`c++`), а для Sendspin
+  (sendspin-cpp) — `cmake` ≥ 3.16 и `ninja`
+  (их можно поставить через `uv tool install cmake ninja`). C++ также собирает
+  on-device детектор «Рикардо» из `crates/pulsar-audio/ricardo/`;
 - `adb` из Android platform-tools.
 
 ```sh
@@ -414,6 +419,10 @@ make -C satellite ARCH=armhf tools                   # диагностичес�
 make -C satellite check                              # проверки на компьютере: rustfmt, clippy, тесты
 go -C installer run . 192.168.1.50                  # установщик из копии репозитория; сам вызывает make
 ```
+
+Для профиля Ricardo положите модель в `satellite/wakewords/ru_ricardo_mww.tflite`
+(инструкция и SHA-256 — `satellite/wakewords/README.md`). Установщик скопирует её
+в `/data/pulsar/wakewords/` с проверкой хеша.
 
 Makefile отказывается работать с zig 0.13 и более ранними. Результат: `satellite/build/<arch>/pulsar`
 (без отладочной информации — его и ставит установщик) и рядом `pulsar.debug` с

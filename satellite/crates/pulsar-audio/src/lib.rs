@@ -8,7 +8,10 @@
 
 pub mod engine;
 mod frontend;
+#[allow(unsafe_code)]
+mod ricardo;
 mod spectrum;
 
 pub use frontend::{FrontendEvent, FrontendHandle, FrontendStats, spawn};
+pub use ricardo::RicardoWake;
 pub use spectrum::SpectrumAnalyzer;

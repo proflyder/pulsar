@@ -1,7 +1,7 @@
-// Fixtures in tests/golden/settings/ come from the C++ reference (rust-port-base): Settings::load
-// and Settings::save of controller.cpp, copied verbatim into a throwaway host harness built with
-// `zig c++ -std=c++20 -O2`. save_*.conf: `save` of the values below; load_*.out: `load` of
-// load_*.in, then `save`.
+// Fixtures in tests/golden/settings/ follow the C++ Settings format (rust-port-base),
+// with this fork's defaults (`wake_word=ricardo`, `nearest_answers=0`). They were produced by
+// the same `Settings::load` / `Settings::save` contract and a throwaway host harness.
+// save_*.conf: `save` of the values below; load_*.out: `load` of load_*.in, then `save`.
 
 use super::*;
 
@@ -44,7 +44,7 @@ fn values() -> Settings {
 }
 
 #[test]
-fn save_matches_cxx_byte_for_byte() {
+fn save_matches_golden_byte_for_byte() {
     assert_eq!(
         Settings::default().serialize().as_bytes(),
         golden("save_default.conf")
@@ -78,7 +78,7 @@ fn save_matches_cxx_byte_for_byte() {
 }
 
 #[test]
-fn parses_a_file_written_by_cxx() {
+fn parses_a_file_written_by_the_fork() {
     let mut s = Settings::default();
     s.parse(&golden("save_values.conf"));
     // Written with 6 significant digits: the values read back are those of the text.

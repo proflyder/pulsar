@@ -12,3 +12,6 @@ log = { workspace = true }
 pulsar-alsa = { path = "../pulsar-alsa" }
 pulsar-core = { path = "../pulsar-core" }
 tokio = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }

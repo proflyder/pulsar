@@ -1,7 +1,8 @@
 //! Microphone front-end: ALSA capture (mic + speaker-feedback channels, layout per Model) ->
 //! Yandex VQE (AEC / beamforming / noise reduction, per-model preset) -> Yandex phrase spotters
-//! (stock models from /system/vendor/quasar/spotter_models): the wake word ("Алиса"/"Яндекс")
-//! and, optionally, the command model ("стоп", "громче", ...).
+//! (stock models from /system/vendor/quasar/spotter_models): the wake word ("Алиса"/"Яндекс"),
+//! the optional on-device «Рикардо» detector, and, optionally, the command model
+//! ("стоп", "громче", ...).
 //!
 //! Two threads: a capture thread that only drains ALSA into a FIFO, and a processing thread
 //! (VQE + spotters). The Lite 2's PDM capture allows at most ~42 ms of buffer (2048 frames at
@@ -29,6 +30,8 @@ use crate::spectrum::SpectrumAnalyzer;
 /// itself.
 const LEVEL_CHUNKS: usize = 47;
 const LEVEL_TOP: usize = 8;
+/// 0.5 s of 16 kHz audio kept for the command spoken immediately after the wake word.
+const PREROLL_SAMPLES: usize = 8000;
 
 /// ALSA buffer in VQE chunks.
 const BUFFER_CHUNKS: u64 = 8;
@@ -41,10 +44,12 @@ const PROCESSING_STACK: usize = 8 << 20;
 
 pub enum FrontendEvent {
     /// level_db: wake word level in dBFS on VQE_OMNI (after echo cancellation, before AGC),
-    /// rounded to 0.1 dB; -100 = no data.
+    /// rounded to 0.1 dB; -100 = no data. `audio` is the 0.5 s pre-roll ending with the chunk
+    /// that confirmed the phrase: without it an immediate command loses its first syllables.
     Wake {
         phrase: String,
         level_db: f32,
+        audio: Vec<i16>,
     },
     Command {
         word: String,
@@ -74,25 +79,34 @@ pub struct FrontendHandle {
     inner: Arc<Inner>,
 }
 
-/// Starts the front-end: dlopen, VQE for the model's preset, the wake word spotter from
-/// `wake_model_dir` (e.g. .../spotter_models/activation/alisa) and, if given, the command
-/// spotter (.../spotter_models/command), then the capture and processing threads. On failure
-/// (logged, "microphone front-end failed to start") the handle works but no event ever comes.
-/// A capture device that cannot be opened is retried every 2 s.
+/// Starts the front-end: dlopen, VQE for the model's preset, the native wake word spotter from
+/// `wake_model_dir` (e.g. .../spotter_models/activation/alisa), the optional Ricardo detector
+/// from `custom_wake_model`, and, if given, the command spotter
+/// (.../spotter_models/command), then the capture and processing threads. `custom_active` selects
+/// the Ricardo detector initially. On failure (logged, "microphone front-end failed to start")
+/// the handle works but no event ever comes. A capture device that cannot be opened is retried
+/// every 2 s.
 pub fn spawn(
     model: &'static Model,
     wake_model_dir: PathBuf,
+    custom_wake_model: Option<PathBuf>,
+    custom_active: bool,
     command_model_dir: Option<PathBuf>,
 ) -> (FrontendHandle, UnboundedReceiver<FrontendEvent>) {
     let (tx, rx) = unbounded_channel();
     let mut inner = Inner {
-        shared: Arc::new(Shared::new()),
+        shared: Arc::new(Shared::new(custom_active)),
         pipe: None,
         threads: Vec::new(),
         _events: tx.clone(),
     };
     let command_dir = command_model_dir.filter(|d| !d.as_os_str().is_empty());
-    let started = match Engine::start(model, &wake_model_dir, command_dir.as_deref()) {
+    let started = match Engine::start(
+        model,
+        &wake_model_dir,
+        custom_wake_model.as_deref(),
+        command_dir.as_deref(),
+    ) {
         Some(eng) => inner
             .start_threads(model, eng, tx)
             .inspect_err(|e| error!("audio threads: {e}"))
@@ -120,6 +134,11 @@ impl FrontendHandle {
     /// Wake word detection on/off (e.g. software mute). On by default.
     pub fn set_detection(&self, on: bool) {
         self.inner.shared.detect.store(on, Relaxed);
+    }
+
+    /// Selects the Ricardo detector (true) or the native spotter (false).
+    pub fn set_custom_wake(&self, on: bool) {
+        self.inner.shared.custom.store(on, Relaxed);
     }
 
     /// Command spotter on/off (commands without the wake word).
@@ -169,6 +188,8 @@ struct Shared {
     stop_lock: Mutex<()>,
     stop_cv: Condvar,
     detect: AtomicBool,
+    /// Ricardo detector (true) or native Yandex spotter (false).
+    custom: AtomicBool,
     commands: AtomicBool,
     stream: AtomicBool,
     music: AtomicBool,
@@ -182,12 +203,13 @@ struct Shared {
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(custom_active: bool) -> Self {
         Shared {
             running: AtomicBool::new(false),
             stop_lock: Mutex::new(()),
             stop_cv: Condvar::new(),
             detect: AtomicBool::new(true),
+            custom: AtomicBool::new(custom_active),
             commands: AtomicBool::new(false),
             stream: AtomicBool::new(false),
             music: AtomicBool::new(false),
@@ -536,6 +558,8 @@ fn processing(
         warn!("music analysis: unsupported capture layout");
     }
     let mut music_was_on = false;
+    let mut preroll = VecDeque::with_capacity(PREROLL_SAMPLES);
+    let mut custom_failed = false;
 
     while shared.running() {
         let pending = lock(&shared.pending_model).take();
@@ -582,21 +606,66 @@ fn processing(
             level_pos = (level_pos + 1) % LEVEL_CHUNKS;
         }
 
-        if shared.stream.load(Relaxed)
-            && let Some(d) = eng.output(VQE_OMNI_WITH_GAIN)
-            && !d.is_empty()
-        {
-            let _ = tx.send(FrontendEvent::Audio(d.iter().map(|&v| to_s16(v)).collect()));
+        // One owned copy of the cleaned stream feeds the pre-roll, the detector
+        // and the optional HA stream. It must be owned before feed_wake borrows
+        // the engine mutably.
+        let clean = eng
+            .output(VQE_OMNI_WITH_GAIN)
+            .filter(|d| !d.is_empty())
+            .map(|d| d.iter().map(|&v| to_s16(v)).collect::<Vec<_>>());
+        if let Some(pcm) = &clean {
+            preroll.extend(pcm.iter().copied());
+            while preroll.len() > PREROLL_SAMPLES {
+                preroll.pop_front();
+            }
         }
 
         if shared.detect.load(Relaxed) {
-            let phrases = eng.feed_wake();
-            if !phrases.is_empty() {
-                let level_db = wake_level_db(&level_hist);
-                for phrase in phrases {
-                    let _ = tx.send(FrontendEvent::Wake { phrase, level_db });
+            let custom = shared.custom.load(Relaxed);
+            if custom {
+                if !custom_failed && let Some(pcm) = &clean {
+                    match eng.feed_custom(pcm) {
+                        Some(Ok((true, score))) => {
+                            let audio = preroll.iter().copied().collect();
+                            preroll.clear();
+                            info!("Ricardo wake word detected (probability {score:.3})");
+                            let _ = tx.send(FrontendEvent::Wake {
+                                phrase: "Рикардо".into(),
+                                level_db: wake_level_db(&level_hist),
+                                audio,
+                            });
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            custom_failed = true;
+                            error!("Ricardo wake word: {e}");
+                        }
+                        None => {
+                            custom_failed = true;
+                            error!("Ricardo wake word: detector is not loaded");
+                        }
+                    }
+                }
+            } else {
+                let phrases = eng.feed_wake();
+                if !phrases.is_empty() {
+                    let audio: Vec<i16> = preroll.iter().copied().collect();
+                    preroll.clear();
+                    let level_db = wake_level_db(&level_hist);
+                    for phrase in phrases {
+                        let _ = tx.send(FrontendEvent::Wake {
+                            phrase,
+                            level_db,
+                            audio: audio.clone(),
+                        });
+                    }
                 }
             }
+        }
+        if shared.stream.load(Relaxed)
+            && let Some(pcm) = clean
+        {
+            let _ = tx.send(FrontendEvent::Audio(pcm));
         }
         if shared.commands.load(Relaxed) {
             for word in eng.feed_command() {
@@ -792,7 +861,7 @@ mod tests {
     fn without_the_yandex_library_the_handle_is_degraded() {
         // No /system/vendor/quasar/libs on the build host: dlopen fails.
         let midi = model_from_compatible(b"yandex,cucumber\0").unwrap();
-        let (h, mut rx) = spawn(midi, PathBuf::from("/nonexistent"), None);
+        let (h, mut rx) = spawn(midi, PathBuf::from("/nonexistent"), None, false, None);
         h.set_streaming(true);
         h.set_model(PathBuf::from("/nonexistent/2"));
         let h2 = h.clone();

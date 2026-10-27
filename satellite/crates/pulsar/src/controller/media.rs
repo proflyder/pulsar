@@ -107,6 +107,9 @@ impl Controller {
         );
         self.api.publish_media(s, self.st.volume, self.st.muted);
         self.update_music();
+        // The local command spotter follows playback: on while music/announcement/
+        // timer speech plays, off in silence and during a dialog.
+        self.update_commands();
     }
 
     pub(super) fn update_music(&self) {
