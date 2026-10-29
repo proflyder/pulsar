@@ -160,6 +160,16 @@ impl SendspinHandle {
         self.client.is_connected()
     }
 
+    /// The daemon is about to be restarted by its supervisor: send `client/goodbye` with reason
+    /// `restart` so Music Assistant redials this player. Without it the library's stop() sends
+    /// `shutdown`, after which MA deliberately does not reconnect until its provider restarts.
+    pub fn goodbye_restart(&self) {
+        if self.client.is_connected() {
+            info!("sendspin: goodbye restart (daemon restarts)");
+            self.client.disconnect_restart();
+        }
+    }
+
     /// Software gain 0..1 applied to Sendspin audio (ramped), used for ducking.
     pub fn set_duck_gain(&self, g: f32) {
         self.ctx.sink.set_gain(g);

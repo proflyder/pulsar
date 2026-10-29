@@ -187,6 +187,7 @@ unsafe extern "C" {
     fn ss_player_update_muted(c: *mut SsClient, muted: bool);
     fn ss_controller_send(c: *mut SsClient, command: u8) -> bool;
     fn ss_leave(c: *mut SsClient);
+    fn ss_disconnect_restart(c: *mut SsClient);
     fn ss_confirm_pairing_window(c: *mut SsClient);
     fn ss_blob_set(blob: *mut SsBlob, data: *const u8, len: usize) -> bool;
 }
@@ -710,6 +711,13 @@ impl<L: Listener> Client<L> {
     pub(crate) fn leave(&self) {
         // SAFETY: as `start`.
         unsafe { ss_leave(self.raw.as_ptr()) }
+    }
+
+    /// Ask the next stop() to send client/goodbye `restart` instead of the shutdown pass's
+    /// `shutdown`: the server (Music Assistant) redials a restarting client.
+    pub(crate) fn disconnect_restart(&self) {
+        // SAFETY: as `start`.
+        unsafe { ss_disconnect_restart(self.raw.as_ptr()) }
     }
 
     pub(crate) fn confirm_pairing_window(&self) {

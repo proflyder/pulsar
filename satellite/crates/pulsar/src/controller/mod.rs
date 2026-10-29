@@ -822,6 +822,15 @@ impl Controller {
         self.state.flush(&self.st);
     }
 
+    /// The supervisor will start this daemon again (the `enabled` file exists): promise the
+    /// Sendspin server a reconnect before the client stops, otherwise its stop() sends
+    /// `shutdown` and Music Assistant deliberately stops redialing this player.
+    pub fn promise_sendspin_restart(&self) {
+        if let Some(ss) = &self.sendspin {
+            ss.goodbye_restart();
+        }
+    }
+
     fn mic_muted(&self) -> bool {
         self.st.mic_muted || self.hw_mic_muted
     }

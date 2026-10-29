@@ -379,6 +379,11 @@ println!("cargo:rustc-link-lib=c++");
   перезапуск потока сервером (seek / skip) не дёргает состояние медиаплеера в HA и музыкальные
   дисплеи. `stopped` завершает удерживаемый конец сразу.
 - `yield_to_local()` только шлёт `client/leave`, `streaming` синхронно не меняет.
+- Выход по рестарту (`enabled` существует: `ctl.sh restart|reload`, HA Restart, обновление)
+  отправляет `client/goodbye` с причиной `restart` до остановки клиента: по протоколу только
+  `restart` разрешает серверу (Music Assistant) переподключиться. Библиотечный `stop()` иначе
+  шлёт `shutdown`, после которого MA сознательно не набирает этот URL до перезапуска своего
+  провайдера. `ctl.sh disable` сначала удаляет `enabled`, поэтому там остаётся `shutdown`.
 
 ### `pulsar-hw` и `pulsar-clock`
 
