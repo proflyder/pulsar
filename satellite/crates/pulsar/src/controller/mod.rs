@@ -306,6 +306,19 @@ impl Controller {
         let dir = logic::state_dir(state_path.as_os_str());
         let strings = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         let with_none = |l: Vec<String>| std::iter::once("None".to_owned()).chain(l).collect();
+        // Opened before the entity list: on a station where the model makes it optional the
+        // Illuminance entity exists only when the sensor is there.
+        let lux_rx = match pulsar_clock::spawn_light_sensor(LUX_PERIOD_MS) {
+            Ok(rx) => Some(rx),
+            Err(e) if model.has_lux => {
+                error!("{e}");
+                None
+            }
+            Err(e) => {
+                info!("{e}");
+                None
+            }
+        };
         let cfg = ApiConfig {
             port: ports.api,
             wake_words: vec![
@@ -341,7 +354,7 @@ impl Controller {
             },
             key_path: Some(logic::in_dir(&dir, "api_key")),
             has_clock: model.has_clock || pulsar_clock::panel_present(model),
-            has_lux: model.has_lux,
+            has_lux: model.has_lux || lux_rx.is_some(),
         };
         // The C++ server bound its port last (ApiServer::start); here the bind comes first, so
         // a failure exits before the hardware starts. Nothing reaches the server before `run`.
@@ -432,11 +445,6 @@ impl Controller {
             }
         };
         let hw_mic_muted = input.as_ref().is_some_and(InputHandle::hw_muted);
-        let lux_rx = if model.has_lux {
-            pulsar_clock::spawn_light_sensor(LUX_PERIOD_MS).ok()
-        } else {
-            None
-        };
         let custom_wake = st.wake_word == "ricardo";
         let (mic, mic_rx) = pulsar_audio::spawn(
             model,
@@ -450,6 +458,7 @@ impl Controller {
             custom_wake,
             Some(PathBuf::from(COMMAND_MODEL)),
         );
+        mic.set_preroll(st.wake_preroll);
 
         let ss_cfg = SendspinConfig {
             name: id.friendly_name.clone(),
@@ -769,8 +778,12 @@ impl Controller {
             FrontendEvent::Wake {
                 phrase,
                 level_db,
-                audio,
-            } => self.on_wake(&phrase, level_db, audio),
+                preroll,
+            } => {
+                self.on_wake(&phrase, level_db, preroll);
+                // After on_wake has switched streaming on where the wake word starts a request.
+                self.mic.wake_handled();
+            }
             FrontendEvent::Command { word } => self.on_command(&word),
             FrontendEvent::Audio(pcm) => {
                 if self.phase == Phase::Listening {
