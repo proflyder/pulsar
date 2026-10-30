@@ -122,8 +122,12 @@ impl Controller {
             }
             return self.stop_timer_ring();
         }
-        if matches!(self.phase, Phase::Listening | Phase::Processing) || self.arbitrating {
-            return;
+        // As stock Alice: a repeated wake word replaces the call in progress instead of being
+        // ignored. The old call is ended only when this station starts the new dialog
+        // (answer_wake): a station that loses wake arbitration keeps its answer, and its busy
+        // claim still counts SPEAKING. A pending claim is replaced by this wake word.
+        if self.arbitrating {
+            self.cancel_arbitration();
         }
         // Without the HA pipeline this station could win and stay silent: it does not take part.
         if !self.arbitration_on() || !self.api.voice_subscribed() {
@@ -145,10 +149,16 @@ impl Controller {
         if self.timer_ringing {
             return self.stop_timer_ring();
         }
+        // A repeated wake word: a LISTENING / PROCESSING dialog is ended, its run stopped, and
+        // RunBinding keeps the replaced run's late RUN_END from ending the new dialog. While
+        // SPEAKING the answer is only cut, as before (the new start replaces its dialog id).
+        // ESPHome pipeline events carry no run id: a run replaced before its RUN_START cannot be
+        // told apart from the new one if that RUN_START was still on the wire.
         if matches!(self.phase, Phase::Listening | Phase::Processing) {
-            return;
-        }
-        if self.phase == Phase::Speaking || self.announcing {
+            info!("wake word: replacing the active dialog");
+            self.interrupt_speech();
+            self.finish_interaction();
+        } else if self.phase == Phase::Speaking || self.announcing {
             self.interrupt_speech(); // barge-in: cut the answer short
         }
         self.start_pipeline(phrase, true, preroll);
@@ -159,7 +169,11 @@ impl Controller {
         self.arb_claim = None;
         let audio = std::mem::take(&mut self.arb_audio);
         if !won {
-            self.mic.set_streaming(false);
+            // A dialog that was already listening keeps streaming: this wake word replaced
+            // nothing unless this station answers it.
+            if self.phase != Phase::Listening {
+                self.mic.set_streaming(false);
+            }
             info!(
                 "wake word: {} answers ({}{:.1} dB, ours {:.1} dB)",
                 best.station,

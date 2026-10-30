@@ -27,7 +27,9 @@ Base: `Morvex885/pulsar` `v0.5.2` (`4cba44a`), merged into `feat/ricardo-rust`
 | Wake word | New on-device «Рикардо» detector, same microWakeWord model as the deployed fork build; `wake_word=ricardo` is the default. |
 | Pre-roll | The wake event carries 0.5 s (16 chunks, 512 ms) of VQE-cleaned audio taken from the shared 1.024 s ring (upstream `wake_preroll` rule `Fixed(16)` for the `ricardo` id), so «Рикардо, включи свет» does not lose its first syllables. The upstream `WakePreroll` switch and `wake_preroll=` key control it. |
 | Silent cancel | `stt-no-text-recognized` is treated as a cancel, not as an error ring. |
+| Repeated wake | A wake word heard during LISTENING / PROCESSING ends that dialog (`voice_request_stop`) and starts a new one with the wake earcon; during SPEAKING the answer is cut and the new dialog starts. A station that loses wake arbitration does not cut its answer. Late events of a replaced started run are dropped (its RUN_END is treated as stale). |
 | `стоп` | The local command spotter is off during LISTENING/PROCESSING/arbitration. «Рикардо, стоп» reaches HA, which stops the alarm and restores the music. |
+| `отмена` | Recognized after the wake word as the request, it is an HA custom intent (`StationCancel`) with no speech and no side effects: no TTS answer and no Hermes fallback. The stock command model has no «отмена», so a mid-call «отмена» without a repeated wake word is not detected locally. |
 | Local commands | The command spotter runs only while something plays and outside a voice request, matching the deployed fork profile rather than upstream's always-on behavior. |
 | Nearest station | Default `nearest_answers=false`: this installation has one station and the 250 ms arbitration window only adds latency. It can be turned back on in HA. |
 | Zigbee | Runtime initialization is disabled (`ENABLE_ZIGBEE=false`); the radio and the `zigbee-*.ybl` assets are left untouched. |
