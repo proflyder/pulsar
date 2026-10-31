@@ -4,7 +4,7 @@
 //!        update_probe get <https_url>
 //!          status, size and sha256 of the body (redirects followed)
 //!        update_probe check [owner/repo]
-//!          latest stable release as the daemon sees it (default Morvex885/pulsar)
+//!          latest stable release as the daemon sees it (default: this fork)
 //!        update_probe install <version> <bin_url> <sums_url> <binary>
 //!          downloads, verifies and swaps <binary> (keeps <binary dir>/pulsar.prev), as the daemon
 //!          does for a release named <version>
@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use pulsar_update::https::{self, CA_BUNDLE, HttpsResponse, Tls};
 use pulsar_update::{Release, UpdateEvent};
 
-const REPO: &str = "Morvex885/pulsar";
+const REPO: &str = pulsar_update::UPDATE_REPO;
 
 fn main() -> ExitCode {
     let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();

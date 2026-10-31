@@ -2,11 +2,13 @@
 
 This fork is the Ricardo Rust profile of Pulsar for the Station Midi
 installation. The station currently runs the earlier Rust build
-`v0.5.0-1-g908a027`; the upstream `v0.5.2` merge in this checkout has only
-passed host-side checks and is not installed until live acceptance.
+`v0.5.0-1-g908a027`; the upstream `v0.5.2` / `v0.5.3` merges in this checkout
+have only passed host-side checks and are not installed until live acceptance.
 
-Base: `Morvex885/pulsar` `v0.5.2` (`4cba44a`), merged into `feat/ricardo-rust`
-(previous tip `908a027` kept as a parent), branch `feat/ricardo-rust`.
+Base: `Morvex885/pulsar` `v0.5.3` (`504830d`), merged into `feat/ricardo-rust`
+(the upstream `v0.5.2` merge stays in history), branch `feat/ricardo-rust`.
+The upstream `v0.5.3` merge itself is on `feat/merge-upstream-v0.5.3` and has not
+been installed or accepted on the station yet.
 
 ## What this profile keeps
 
