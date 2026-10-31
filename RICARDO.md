@@ -64,6 +64,52 @@ cp /path/to/ru_ricardo_mww.tflite satellite/wakewords/
 Without the model the daemon starts but logs that the Ricardo detector is
 missing; it does not silently fall back to «Алиса».
 
+## Релизы и деплой форка
+
+Теги форка продолжают нумерацию upstream, чтобы `releases/latest` GitHub всегда указывал на
+сборку форка: `v<upstream major.minor>.<1000+N>` — например `v0.5.1001`, `v0.5.1002`; после
+merge upstream `v0.6.x` — `v0.6.1001`. Патч-номер 1000+ больше любого upstream-патча, поэтому
+сравнение версий (`vMAJOR.MINOR.PATCH`) считает релиз форка новее.
+
+1. Собрать и проверить ветку, затем поставить аннотированный тег и отправить его:
+
+   ```bash
+   git tag -a v0.5.1001 -m 'pulsar v0.5.1001'
+   git push origin v0.5.1001
+   ```
+
+2. `build.yml` на тег `v*` собирает оба бинарника, dropbear, radio и установщик, публикует
+   GitHub release (`--latest`) и запускает `deploy-station.yml`.
+3. В Actions запуск деплоя ждёт одобрения в Environment `Station` (required reviewer).
+4. После одобрения job по OIDC входит в OpenBao, поднимает VPN (группа `ci`), вызывает
+   `tools/ha_firmware_deploy.py --tag <tag>`: HA `homeassistant.update_entity` → сущность
+   «Firmware» видит тег → `update.install` → колонка скачивает, проверяет `SHA256SUMS` и
+   `--version`, меняет бинарник (старый остаётся `.prev`) и перезапускается. Скрипт ждёт
+   `installed_version == tag` и ещё 90 с следит за стабильностью; откат `supervise.sh` на
+   `.prev` или недоступность сущности дольше 30 с валят job.
+5. Проверить в HA: «Firmware» показывает установленную версию, колонка онлайн; при сомнениях —
+   `ctl.sh log` на станции.
+
+Повторный деплой уже опубликованного релиза — вручную: Actions → `deploy-station` → Run
+workflow, `tag` = существующий стабильный тег; в «Use workflow from» выбрать этот же тег
+(`gh workflow run deploy-station.yml --ref v0.5.1001 -f tag=v0.5.1001`): Environment пускает
+только теги `v*`. Если версия уже стоит, скрипт печатает
+`already installed` и выходит успешно.
+
+Откат через dispatch **невозможен**: обновлятор предлагает только более новые версии, поэтому
+старый тег не появится в `latest_version`. Откат делается на станции: `.prev` (или резервная
+копия бинарника) и `ctl.sh restart`, подробности и команды — в `docs/OPERATIONS.md`
+монорепозитория (раздел про станцию). После отката автообновление не поставит сломанный тег
+повторно (маркер `update_attempt`).
+
+Что должно быть настроено в GitHub (значения не хранятся в репозитории):
+
+- Environment `Station`: required reviewer, deployment tag rule `v*`;
+- его secrets: `VPN_SERVER`, `VPN_CERT_P12_B64`, `VPN_CERT_PASSWORD`, `OPENBAO_ADDR`,
+  при необходимости `OPENBAO_ROLE` (по умолчанию `deploy-station`);
+- в OpenBao роль `deploy-station` для `auth/github` и секрет `secret/data/ci/deploy-station`
+  с ключами `ha_url`, `ha_token`, `entity_id` (сущность `update.<station>_firmware`).
+
 ## Verification performed
 
 All checks were host-side; no binary was installed and no station was touched.
