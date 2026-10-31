@@ -186,17 +186,6 @@ fn command_words() {
 }
 
 #[test]
-fn command_gating() {
-    // The window after the wake word: 2.5 s of LISTENING / PROCESSING.
-    assert!(after_wake(Phase::Listening, 12_499, 10_000));
-    assert!(!after_wake(Phase::Listening, 12_500, 10_000));
-    assert!(after_wake(Phase::Processing, 12_499, 10_000));
-    assert!(!after_wake(Phase::Processing, 12_500, 10_000));
-    assert!(!after_wake(Phase::Idle, 10_001, 10_000));
-    assert!(!after_wake(Phase::Speaking, 10_001, 10_000));
-}
-
-#[test]
 fn music_ownership() {
     use PlayState as P;
     let now = 10 * PAUSED_MUSIC_MS;
@@ -327,7 +316,7 @@ fn volume_click_gating() {
     for phase in [Phase::Listening, Phase::Speaking] {
         assert!(!click(step.0, step.1, phase), "{phase:?}");
     }
-    // A held key at the top or bottom; f32 5 % steps down end at 7.45e-9 before 0.
+    // A held key at the top or bottom; older builds saved 7.45e-9 for 0 to state.conf.
     assert!(!click((1.0, false), (1.0, false), Phase::Idle));
     assert!(!click((7.45e-9, false), (0.0, false), Phase::Idle));
     // A key at 0 while muted unmutes: that is a change.

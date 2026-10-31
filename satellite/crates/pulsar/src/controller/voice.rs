@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use log::{debug, info, warn};
+use pulsar_audio::endpoint::{EndpointPrior, EndpointRun, pcm_level_db};
 use pulsar_core::{ClockShot, UiState, now_ms};
 use pulsar_esphome::{AnnounceRequest, TimerEvent, TimerInfo, VaEvent};
 use pulsar_lan::arbiter::Claim;
@@ -53,7 +54,7 @@ impl Controller {
                         && !self.timer_ringing
                         && !self.mic_muted()
                     {
-                        self.start_pipeline("", false, Vec::new());
+                        self.start_pipeline("", false, Vec::new(), Vec::new(), None);
                     }
                     self.end_announce();
                 }
@@ -107,7 +108,13 @@ impl Controller {
 
     // ---------------- wake word ----------------
 
-    pub(super) fn on_wake(&mut self, phrase: &str, level_db: f32) {
+    pub(super) fn on_wake(
+        &mut self,
+        phrase: &str,
+        level_db: f32,
+        preroll: Vec<i16>,
+        endpoint_prior: Option<EndpointPrior>,
+    ) {
         if self.mic_muted() {
             return;
         }
@@ -122,46 +129,72 @@ impl Controller {
             }
             return self.stop_timer_ring();
         }
-        if matches!(self.phase, Phase::Listening | Phase::Processing) || self.arbitrating {
-            return;
+        // As stock Alice: a repeated wake word replaces the call in progress instead of being
+        // ignored. The old call is ended only when this station starts the new dialog
+        // (answer_wake): a station that loses wake arbitration keeps its answer, and its busy
+        // claim still counts SPEAKING. A pending claim is replaced by this wake word.
+        if self.arbitrating {
+            self.cancel_arbitration();
         }
         // Without the HA pipeline this station could win and stay silent: it does not take part.
         if !self.arbitration_on() || !self.api.voice_subscribed() {
-            return self.answer_wake(phrase, Vec::new());
+            return self.answer_wake(phrase, preroll, Vec::new(), endpoint_prior);
         }
         self.arbitrating = true;
         // A station that lost the previous wake word may win this one.
         self.commands_blocked_until_ms = 0;
         self.arb_phrase = phrase.to_owned();
         self.arb_level = level_db;
-        self.arb_audio.clear();
-        self.arb_command.clear();
+        self.arb_audio = preroll;
+        // Everything after this point is live post-wake speech held during the decision; the
+        // detector must not treat it as pre-roll evidence.
+        self.arb_boundary = self.arb_audio.len();
+        self.arb_endpoint = endpoint_prior;
         self.mic.set_streaming(true);
         self.update_ui();
         let busy = self.phase == Phase::Speaking || self.announcing;
         self.arb_claim = Some(self.arbiter.claim(&self.st.wake_word, level_db, busy, true));
     }
 
-    fn answer_wake(&mut self, phrase: &str, preroll: Vec<i16>) {
+    fn answer_wake(
+        &mut self,
+        phrase: &str,
+        preroll: Vec<i16>,
+        live: Vec<i16>,
+        endpoint_prior: Option<EndpointPrior>,
+    ) {
         if self.timer_ringing {
             return self.stop_timer_ring();
         }
+        // A repeated wake word: a LISTENING / PROCESSING dialog is ended, its run stopped, and
+        // RunBinding keeps the replaced run's late RUN_END from ending the new dialog. While
+        // SPEAKING the answer is only cut, as before (the new start replaces its dialog id).
+        // ESPHome pipeline events carry no run id: a run replaced before its RUN_START cannot be
+        // told apart from the new one if that RUN_START was still on the wire.
         if matches!(self.phase, Phase::Listening | Phase::Processing) {
-            return;
-        }
-        if self.phase == Phase::Speaking || self.announcing {
+            info!("wake word: replacing the active dialog");
+            self.interrupt_speech();
+            self.finish_interaction();
+        } else if self.phase == Phase::Speaking || self.announcing {
             self.interrupt_speech(); // barge-in: cut the answer short
         }
-        self.start_pipeline(phrase, true, preroll);
+        self.start_pipeline(phrase, true, preroll, live, endpoint_prior);
     }
 
     pub(super) fn arbitration_done(&mut self, won: bool, best: &Claim, peers: usize) {
         self.arbitrating = false;
         self.arb_claim = None;
-        let audio = std::mem::take(&mut self.arb_audio);
-        let command = std::mem::take(&mut self.arb_command);
+        let mut audio = std::mem::take(&mut self.arb_audio);
+        let split = self.arb_boundary.min(audio.len());
+        let live = audio.split_off(split);
+        self.arb_boundary = 0;
+        let prior = self.arb_endpoint.take();
         if !won {
-            self.mic.set_streaming(false);
+            // A dialog that was already listening keeps streaming: this wake word replaced
+            // nothing unless this station answers it.
+            if self.phase != Phase::Listening {
+                self.mic.set_streaming(false);
+            }
             info!(
                 "wake word: {} answers ({}{:.1} dB, ours {:.1} dB)",
                 best.station,
@@ -175,16 +208,10 @@ impl Controller {
             return;
         }
         info!("wake word: this station answers ({peers} other station(s) heard it)");
-        if !command.is_empty() {
-            // "Алиса, громче": handled locally, as right after the wake word.
-            self.mic.set_streaming(false);
-            self.update_ui();
-            return self.on_command(&command, true);
-        }
         // Capture keeps streaming into the new dialog: switching it off here could drop the
         // chunk between the preroll and live audio.
         let phrase = self.arb_phrase.clone();
-        self.answer_wake(&phrase, audio);
+        self.answer_wake(&phrase, audio, live, prior);
         if self.phase != Phase::Listening {
             self.mic.set_streaming(false); // no dialog started (e.g. HA gone)
         }
@@ -198,7 +225,8 @@ impl Controller {
         self.arbitrating = false;
         self.arb_claim = None;
         self.arb_audio.clear();
-        self.arb_command.clear();
+        self.arb_boundary = 0;
+        self.arb_endpoint = None;
         if self.phase != Phase::Listening {
             self.mic.set_streaming(false);
         }
@@ -206,8 +234,24 @@ impl Controller {
 
     // ---------------- pipeline ----------------
 
-    /// The only way into LISTENING (the watchdog bounds it).
-    pub(super) fn start_pipeline(&mut self, phrase: &str, earcon: bool, preroll: Vec<i16>) {
+    /// Uncalibrated energy heuristic: opt-in only, off unless explicitly enabled.
+    fn local_endpointing_enabled() -> bool {
+        matches!(
+            std::env::var("PULSAR_LOCAL_ENDPOINTING").as_deref(),
+            Ok("1")
+        )
+    }
+
+    /// The only way into LISTENING (the watchdog bounds it). `preroll` came with the wake event;
+    /// `live` is post-wake audio held during wake arbitration (empty otherwise).
+    pub(super) fn start_pipeline(
+        &mut self,
+        phrase: &str,
+        earcon: bool,
+        preroll: Vec<i16>,
+        live: Vec<i16>,
+        endpoint_prior: Option<EndpointPrior>,
+    ) {
         // The button, a continued conversation or HA's start_conversation win.
         self.cancel_arbitration();
         if !self.api.voice_subscribed() {
@@ -222,6 +266,19 @@ impl Controller {
         self.dialog += 1;
         self.run.start();
         self.stop_sent = false;
+        self.endpoint = if Self::local_endpointing_enabled() {
+            endpoint_prior.and_then(|p| EndpointRun::new(p, &preroll, &live))
+        } else {
+            None
+        };
+        if let Some(r) = self.endpoint.as_ref() {
+            let p = r.prior();
+            let (on, off) = r.thresholds();
+            debug!(
+                "local endpointing: noise {:.1} dB, wake {:.1} dB, onset {:.1} dB, release {:.1} dB",
+                p.noise_db, p.speech_db, on, off
+            );
+        }
         self.listen_started_ms = now_ms();
         self.tts_url.clear();
         self.tts_played = false;
@@ -241,17 +298,67 @@ impl Controller {
         for chunk in preroll.chunks(512) {
             self.api.voice_send_audio(chunk.to_vec());
         }
+        for chunk in live.chunks(512) {
+            self.api.voice_send_audio(chunk.to_vec());
+        }
         self.mic.set_streaming(true);
         self.arm_watchdog();
         self.update_ui();
     }
 
     fn stop_streaming(&mut self) {
+        // HA finished the phrase first (STT_VAD_END/STT_END), the dialog was cancelled or a
+        // repeated wake replaced it: drop the run so no stale end can follow.
+        if let Some(r) = self.endpoint.as_mut() {
+            r.cancel();
+        }
+        self.endpoint = None;
         // A wake word heard meanwhile keeps its audio.
         self.mic.set_streaming(self.arbitrating);
         if self.phase == Phase::Listening {
             self.phase = Phase::Processing;
         }
+    }
+
+    /// One live 32 ms chunk while the dialog listens. Sends it to HA and feeds the optional
+    /// local detector; a detected end is deferred while the wake earcon is playing.
+    pub(super) fn on_listening_audio(&mut self, pcm: Vec<i16>) {
+        if let Some(r) = self.endpoint.as_mut() {
+            r.push(pcm_level_db(&pcm), true);
+        }
+        self.api.voice_send_audio(pcm);
+        let earcon = matches!(
+            self.player.state(Channel::Announce),
+            PlayState::Playing | PlayState::Loading
+        );
+        if !earcon
+            && self.phase == Phase::Listening
+            && self.endpoint.as_mut().is_some_and(|r| r.take_end())
+        {
+            self.send_endpoint_end();
+        }
+    }
+
+    /// Graceful `VoiceAssistantAudio.end`: finish the phrase on what HA already has, without
+    /// aborting the run. Exactly once per dialog; a stale or replaced dialog sends nothing.
+    fn send_endpoint_end(&mut self) {
+        if self.stop_sent || self.phase != Phase::Listening {
+            return;
+        }
+        if let Some(r) = self.endpoint.as_ref() {
+            let p = r.prior();
+            let (on, off) = r.thresholds();
+            info!(
+                "voice pipeline: local end (experimental), noise {:.1} dB, wake {:.1} dB, \
+                 onset {:.1} dB, release {:.1} dB",
+                p.noise_db, p.speech_db, on, off
+            );
+        }
+        self.api.voice_send_audio_end();
+        // Stop feeding the microphone, but keep the run: HA finishes STT and the answer.
+        self.stop_streaming();
+        self.arm_watchdog();
+        self.update_ui();
     }
 
     pub(super) fn on_voice_event(&mut self, ev: VaEvent, data: &HashMap<String, String>) {
@@ -312,15 +419,18 @@ impl Controller {
                         "pipeline: another satellite answers this wake word (HA duplicate wake-up)"
                     );
                     self.stop_streaming();
+                } else if get("code") == "stt-no-text-recognized" {
+                    // Empty STT after a wake word: the user changed their mind or spoke
+                    // too softly. Treat it as a silent cancel, not a station error.
+                    info!("pipeline: no speech recognized, treating as cancel");
+                    self.stop_streaming();
                 } else {
                     warn!("pipeline error: {} {}", get("code"), get("message"));
                     self.stop_streaming();
                     self.error_shown = true;
                     self.show_ui(UiState::Error);
-                    if get("code") != "stt-no-text-recognized" {
-                        let sound = format!("{SOUNDS}{}", self.model.error_sound);
-                        self.play_closing_earcon(sound);
-                    }
+                    let sound = format!("{SOUNDS}{}", self.model.error_sound);
+                    self.play_closing_earcon(sound);
                 }
             }
             VaEvent::RunEnd => {
@@ -352,7 +462,7 @@ impl Controller {
         self.send_tts_report(ok);
         if ok && self.continue_conversation && !self.timer_ringing && !self.mic_muted() {
             self.continue_conversation = false;
-            self.start_pipeline("", false, Vec::new());
+            self.start_pipeline("", false, Vec::new(), Vec::new(), None);
             return;
         }
         self.finish_interaction();
@@ -384,6 +494,7 @@ impl Controller {
         }
         self.run.awaiting_run_start = false;
         self.send_tts_report(false);
+        self.endpoint = None;
         self.mic.set_streaming(self.arbitrating);
         self.phase = Phase::Idle;
         self.dialog += 1;
@@ -475,7 +586,7 @@ impl Controller {
             self.interrupt_speech();
             return self.finish_interaction();
         }
-        self.start_pipeline("", true, Vec::new());
+        self.start_pipeline("", true, Vec::new(), Vec::new(), None);
     }
 
     // ---------------- announcements ----------------
@@ -629,10 +740,23 @@ impl Controller {
     // ---------------- local commands ----------------
 
     /// Stock command spotter ("стоп", "хватит", "пауза", "продолжи", "громче", "тише", "дальше",
-    /// "назад"): on unless the microphone is muted, the dialog included; which words act where is
-    /// logic::command_allowed.
+    /// "назад"): on while something plays, off in silence and during a wake request. Which words
+    /// act where is logic::command_allowed.
     pub(super) fn update_commands(&self) {
-        self.mic.set_commands(!self.mic_muted());
+        // Stock commands without the wake word stay available while something plays,
+        // as in the C++ build. During a wake request they are off: «Рикардо, стоп»
+        // must reach Home Assistant so it can stop an alarm and restore the music,
+        // instead of being swallowed as a local pause.
+        let playing = matches!(
+            self.player.state(Channel::Music),
+            PlayState::Playing | PlayState::Loading
+        ) || self.sendspin_streaming()
+            || self.announcing
+            || self.timer_ringing
+            || self.phase == Phase::Speaking;
+        let dialog = matches!(self.phase, Phase::Listening | Phase::Processing) || self.arbitrating;
+        self.mic
+            .set_commands(!self.mic_muted() && playing && !dialog);
     }
 
     fn owns_music(&self) -> bool {
@@ -674,9 +798,7 @@ impl Controller {
         }
     }
 
-    /// `held`: the word came during a wake arbitration this station won, right after its wake
-    /// word.
-    pub(super) fn on_command(&mut self, word: &str, held: bool) {
+    pub(super) fn on_command(&mut self, word: &str) {
         if self.mic_muted() {
             return;
         }
@@ -687,53 +809,24 @@ impl Controller {
             info!("voice command '{word}' ignored: another station answers this wake word");
             return;
         }
-        if self.arbitrating {
-            self.arb_command = word.to_owned();
-            info!("voice command '{word}' held until the wake arbitration ends");
+        // A wake request owns the command. Sending "стоп" to Home Assistant is what
+        // stops a ringing alarm and restores the paused music; local handling would
+        // only pause the music and cancel the pipeline. This also covers a callback
+        // queued just before update_commands() switched the spotter off.
+        if matches!(self.phase, Phase::Listening | Phase::Processing) || self.arbitrating {
+            info!("voice command '{word}' left to Home Assistant during a voice request");
             return;
         }
-        let after_wake = logic::after_wake(self.phase, now_ms(), self.listen_started_ms);
-        // A dialog past the window after its wake word: its words are the request's, except
-        // "стоп".
-        let in_dialog = matches!(self.phase, Phase::Listening | Phase::Processing) && !after_wake;
         let sounding = self.phase == Phase::Speaking || self.announcing || self.timer_ringing;
-        if !logic::command_allowed(
-            c,
-            held || after_wake,
-            in_dialog,
-            sounding,
-            self.owns_music(),
-        ) {
-            if in_dialog {
-                info!("voice command '{word}' ignored: part of the request");
-            } else {
-                info!("voice command '{word}' ignored: not for this station");
-            }
+        if !logic::command_allowed(c, false, false, sounding, self.owns_music()) {
+            info!("voice command '{word}' ignored: not for this station");
             return;
         }
-        info!(
-            "voice command '{word}'{}",
-            if after_wake {
-                " (after wake word, HA pipeline cancelled)"
-            } else if held {
-                " (after wake word)"
-            } else if in_dialog {
-                " (in a dialog)"
-            } else {
-                ""
-            }
-        );
-        // A word in the dialog's own window ends the dialog first; one held through an
-        // arbitration in SPEAKING / IDLE leaves the answer playing.
-        if after_wake {
-            self.finish_interaction();
-        }
+        info!("voice command '{word}'");
         match c {
             VoiceCommand::Stop => {
                 if self.timer_ringing {
                     self.stop_timer_ring();
-                } else if in_dialog {
-                    self.cancel_dialog();
                 } else if self.phase == Phase::Speaking {
                     self.interrupt_speech();
                     self.finish_interaction();
@@ -753,8 +846,8 @@ impl Controller {
             }
             VoiceCommand::Resume => self.music_resume(),
             VoiceCommand::Louder | VoiceCommand::Quieter => {
-                let step = if c == VoiceCommand::Louder { 0.1 } else { -0.1 };
-                self.set_volume(self.st.volume + step, true);
+                let up = c == VoiceCommand::Louder;
+                self.set_volume(pulsar_media::mixer::step_alice(self.st.volume, up), true);
             }
             VoiceCommand::Next | VoiceCommand::Prev => {
                 let (t, shot) = if c == VoiceCommand::Next {

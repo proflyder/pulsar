@@ -14,7 +14,7 @@ mod version;
 
 use std::ffi::OsStr;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -72,6 +72,11 @@ fn main() -> ExitCode {
     };
     let local = tokio::task::LocalSet::new();
     let status = local.block_on(&rt, async {
+        // Sampled at exit, not here: `ctl.sh disable` removes the marker before stopping us.
+        let restart_marker = state
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("enabled");
         let mut ctl = match Controller::start(model, state) {
             Ok(c) => c,
             Err(e) => {
@@ -85,6 +90,11 @@ fn main() -> ExitCode {
             model.model_name, model.codename
         );
         ctl.run().await;
+        // `enabled` is what supervise.sh restarts on: promise MA a reconnect only when this is
+        // a restart, not a deliberate ctl.sh disable (it removes enabled first) or a manual run.
+        if supervisor_restarts(&restart_marker) {
+            ctl.promise_sendspin_restart();
+        }
         arm_teardown_watchdog(0);
         // Nothing changes the settings after run: a change still pending is written once, here.
         // Inside the watchdog, so a hung fsync cannot keep the daemon from exiting (a write cut
@@ -104,4 +114,35 @@ fn main() -> ExitCode {
     // A plain drop would wait for spawn_blocking work without limit.
     rt.shutdown_timeout(Duration::from_secs(1));
     ExitCode::from(status)
+}
+
+/// Whether supervise.sh will start this daemon again (`<state dir>/enabled` exists at exit).
+fn supervisor_restarts(enabled: &Path) -> bool {
+    enabled.is_file()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_restart_follows_the_enabled_file_next_to_the_state() {
+        let dir = std::env::temp_dir().join(format!("pulsar-restart-test-{}", std::process::id()));
+        let state = dir.join("state.conf");
+        let marker = dir.join("enabled");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!supervisor_restarts(&marker));
+        std::fs::write(&marker, b"").unwrap();
+        assert!(supervisor_restarts(&marker));
+        // `ctl.sh disable`: enabled removed before the signal, so the daemon sends `shutdown`.
+        std::fs::remove_file(&marker).unwrap();
+        assert!(!supervisor_restarts(&marker));
+        // The same state path derives the marker the supervisor reads.
+        assert_eq!(
+            state.parent().unwrap().join("enabled"),
+            marker,
+            "marker next to state.conf"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

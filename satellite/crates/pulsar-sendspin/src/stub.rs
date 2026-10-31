@@ -44,6 +44,10 @@ impl SendspinHandle {
     pub fn confirm_pairing_window(&self) {
         match self.never {}
     }
+
+    pub fn goodbye_restart(&self) {
+        match self.never {}
+    }
 }
 
 pub fn spawn(

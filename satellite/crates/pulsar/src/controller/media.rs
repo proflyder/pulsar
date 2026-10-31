@@ -107,6 +107,9 @@ impl Controller {
         );
         self.api.publish_media(s, self.st.volume, self.st.muted);
         self.update_music();
+        // The local command spotter follows playback: on while music/announcement/
+        // timer speech plays, off in silence and during a dialog.
+        self.update_commands();
     }
 
     pub(super) fn update_music(&self) {
@@ -193,8 +196,13 @@ impl Controller {
                 MediaCommand::Mute | MediaCommand::Unmute => {
                     self.set_muted(c == MediaCommand::Mute);
                 }
-                MediaCommand::VolumeUp => self.set_volume(self.st.volume + 0.05, false),
-                MediaCommand::VolumeDown => self.set_volume(self.st.volume - 0.05, false),
+                MediaCommand::VolumeUp | MediaCommand::VolumeDown => {
+                    let up = c == MediaCommand::VolumeUp;
+                    self.set_volume(
+                        pulsar_media::mixer::step_level(self.model, self.st.volume, up),
+                        false,
+                    );
+                }
                 _ => debug!("media command {} ignored", c as u32),
             }
         }

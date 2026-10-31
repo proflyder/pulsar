@@ -237,13 +237,6 @@ pub fn command_of(word: &str) -> Option<VoiceCommand> {
     })
 }
 
-/// Within the window after the wake word that opened this dialog: HA may end the speech of a
-/// short "Алиса, громче" (PROCESSING) before the command spotter confirms the word.
-pub fn after_wake(phase: Phase, now: i64, listen_started_ms: i64) -> bool {
-    matches!(phase, Phase::Listening | Phase::Processing)
-        && now - listen_started_ms < COMMAND_AFTER_WAKE_MS
-}
-
 /// Music of this station: playing or loading on the HA media channel or as a Sendspin stream, or
 /// paused / ended less than PAUSED_MUSIC_MS ago (Sendspin: its server still connected).
 /// `*_since`: when the media channel paused / the Sendspin stream ended; None = not since start.
@@ -321,8 +314,8 @@ pub fn want_duck(
 /// timer ring, closing earcons and the wake earcon: a new play() there cuts whatever plays. In
 /// LISTENING and while arbitrating the microphone audio goes to HA's speech-to-text. A level
 /// that stayed put (held key at 0 or 1) does not click; levels compare in whole percent, since
-/// f32 5 % steps down from 0.15..0.3 end at 7.45e-9, one step short of 0. `before` / `after`:
-/// (volume, muted).
+/// builds before the level-grid steps saved drifted volumes such as 7.45e-9 (one 5 % step short
+/// of 0) to state.conf. `before` / `after`: (volume, muted).
 pub fn want_volume_click(
     before: (f32, bool),
     after: (f32, bool),

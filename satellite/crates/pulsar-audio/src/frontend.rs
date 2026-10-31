@@ -1,7 +1,8 @@
 //! Microphone front-end: ALSA capture (mic + speaker-feedback channels, layout per Model) ->
 //! Yandex VQE (AEC / beamforming / noise reduction, per-model preset) -> Yandex phrase spotters
-//! (stock models from /system/vendor/quasar/spotter_models): the wake word ("Алиса"/"Яндекс")
-//! and, optionally, the command model ("стоп", "громче", ...).
+//! (stock models from /system/vendor/quasar/spotter_models): the wake word ("Алиса"/"Яндекс"),
+//! the optional on-device «Рикардо» detector, and, optionally, the command model
+//! ("стоп", "громче", ...).
 //!
 //! Two threads: a capture thread that only drains ALSA into a FIFO, and a processing thread
 //! (VQE + spotters). The Lite 2's PDM capture allows at most ~42 ms of buffer (2048 frames at
@@ -10,7 +11,9 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU32, AtomicU64, Ordering::AcqRel, Ordering::Acquire, Ordering::Relaxed,
+};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -18,10 +21,11 @@ use std::time::Duration;
 use log::{error, info, warn};
 use pulsar_alsa::{Format, HwRequest, HwTrace, Pcm, Stream};
 use pulsar_core::MusicFrame;
-use pulsar_core::model::Model;
+use pulsar_core::model::{Model, PrerollRule};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::engine::{Engine, VQE_OMNI, VQE_OMNI_WITH_GAIN, to_s16};
+use crate::endpoint::{EndpointPrior, percentile_db};
+use crate::engine::{Engine, Stage, VQE_OMNI, VQE_OMNI_WITH_GAIN, to_s16};
 use crate::spectrum::SpectrumAnalyzer;
 
 /// Wake word level window: 1.5 s of 32 ms VQE frames (512 samples @ 16 kHz on both models),
@@ -29,6 +33,11 @@ use crate::spectrum::SpectrumAnalyzer;
 /// itself.
 const LEVEL_CHUNKS: usize = 47;
 const LEVEL_TOP: usize = 8;
+/// Pre-roll ring: 1.024 s of VQE chunks, more than any wake word's confirmation delay.
+const PREROLL_CHUNKS: usize = 32;
+/// End of speech for the "wake timing" log: the newest chunk within 20 dB (power) of the
+/// loudest one in the level window.
+const SPEECH_END_RATIO: f32 = 0.01;
 
 /// ALSA buffer in VQE chunks.
 const BUFFER_CHUNKS: u64 = 8;
@@ -41,15 +50,25 @@ const PROCESSING_STACK: usize = 8 << 20;
 
 pub enum FrontendEvent {
     /// level_db: wake word level in dBFS on VQE_OMNI (after echo cancellation, before AGC),
-    /// rounded to 0.1 dB; -100 = no data.
+    /// rounded to 0.1 dB; -100 = no data. `audio` is the 0.5 s pre-roll ending with the chunk
+    /// that confirmed the phrase: without it an immediate command loses its first syllables.
     Wake {
         phrase: String,
         level_db: f32,
+        /// 16 kHz mono audio from the end of the wake word up to and including the confirming
+        /// chunk, oldest first; empty without values for the model (`Model::wake_preroll`).
+        /// The `Audio` events after it continue it without a gap until
+        /// [`FrontendHandle::wake_handled`].
+        preroll: Vec<i16>,
+        /// Levels of the wake window on the same channel as `Audio`, for the experimental
+        /// local endpoint detector. None until a full window was seen.
+        endpoint_prior: Option<EndpointPrior>,
     },
     Command {
         word: String,
     },
-    /// 16 kHz mono, one VQE chunk (512 samples), while streaming is on.
+    /// 16 kHz mono, one VQE chunk (512 samples), while streaming is on or a `Wake` is not yet
+    /// handled.
     Audio(Vec<i16>),
     /// One per VQE chunk (32 ms) while music analysis is on.
     Music(MusicFrame),
@@ -74,25 +93,34 @@ pub struct FrontendHandle {
     inner: Arc<Inner>,
 }
 
-/// Starts the front-end: dlopen, VQE for the model's preset, the wake word spotter from
-/// `wake_model_dir` (e.g. .../spotter_models/activation/alisa) and, if given, the command
-/// spotter (.../spotter_models/command), then the capture and processing threads. On failure
-/// (logged, "microphone front-end failed to start") the handle works but no event ever comes.
-/// A capture device that cannot be opened is retried every 2 s.
+/// Starts the front-end: dlopen, VQE for the model's preset, the native wake word spotter from
+/// `wake_model_dir` (e.g. .../spotter_models/activation/alisa), the optional Ricardo detector
+/// from `custom_wake_model`, and, if given, the command spotter
+/// (.../spotter_models/command), then the capture and processing threads. `custom_active` selects
+/// the Ricardo detector initially. On failure (logged, "microphone front-end failed to start")
+/// the handle works but no event ever comes. A capture device that cannot be opened is retried
+/// every 2 s.
 pub fn spawn(
     model: &'static Model,
     wake_model_dir: PathBuf,
+    custom_wake_model: Option<PathBuf>,
+    custom_active: bool,
     command_model_dir: Option<PathBuf>,
 ) -> (FrontendHandle, UnboundedReceiver<FrontendEvent>) {
     let (tx, rx) = unbounded_channel();
     let mut inner = Inner {
-        shared: Arc::new(Shared::new()),
+        shared: Arc::new(Shared::new(custom_active)),
         pipe: None,
         threads: Vec::new(),
         _events: tx.clone(),
     };
     let command_dir = command_model_dir.filter(|d| !d.as_os_str().is_empty());
-    let started = match Engine::start(model, &wake_model_dir, command_dir.as_deref()) {
+    let started = match Engine::start(
+        model,
+        &wake_model_dir,
+        custom_wake_model.as_deref(),
+        command_dir.as_deref(),
+    ) {
         Some(eng) => inner
             .start_threads(model, eng, tx)
             .inspect_err(|e| error!("audio threads: {e}"))
@@ -122,6 +150,11 @@ impl FrontendHandle {
         self.inner.shared.detect.store(on, Relaxed);
     }
 
+    /// Selects the Ricardo detector (true) or the native spotter (false).
+    pub fn set_custom_wake(&self, on: bool) {
+        self.inner.shared.custom.store(on, Relaxed);
+    }
+
     /// Command spotter on/off (commands without the wake word).
     pub fn set_commands(&self, on: bool) {
         self.inner.shared.commands.store(on, Relaxed);
@@ -130,6 +163,22 @@ impl FrontendHandle {
     /// While on, cleaned 16 kHz audio comes as [`FrontendEvent::Audio`].
     pub fn set_streaming(&self, on: bool) {
         self.inner.shared.stream.store(on, Relaxed);
+    }
+
+    /// The owner handled one [`FrontendEvent::Wake`]: ends the stream hold it started. Call it
+    /// after `set_streaming` for that wake word.
+    pub fn wake_handled(&self) {
+        let _ = self
+            .inner
+            .shared
+            .wake_pending
+            .try_update(AcqRel, Acquire, |v| v.checked_sub(1));
+    }
+
+    /// Pre-roll in [`FrontendEvent::Wake`] on/off (`Model::wake_preroll`). On by default; the
+    /// stream hold after a `Wake` does not depend on it.
+    pub fn set_preroll(&self, on: bool) {
+        self.inner.shared.preroll.store(on, Relaxed);
     }
 
     /// While on, music features of the speaker reference come as [`FrontendEvent::Music`].
@@ -169,8 +218,14 @@ struct Shared {
     stop_lock: Mutex<()>,
     stop_cv: Condvar,
     detect: AtomicBool,
+    /// Ricardo detector (true) or native Yandex spotter (false).
+    custom: AtomicBool,
     commands: AtomicBool,
     stream: AtomicBool,
+    /// `Wake` events sent and not yet handled: audio keeps coming meanwhile, so nothing is lost
+    /// between the confirmation and the owner's `set_streaming(true)`.
+    wake_pending: AtomicU32,
+    preroll: AtomicBool,
     music: AtomicBool,
     pending_model: Mutex<Option<PathBuf>>,
     tap_on: AtomicBool,
@@ -182,14 +237,17 @@ struct Shared {
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(custom_active: bool) -> Self {
         Shared {
             running: AtomicBool::new(false),
             stop_lock: Mutex::new(()),
             stop_cv: Condvar::new(),
             detect: AtomicBool::new(true),
+            custom: AtomicBool::new(custom_active),
             commands: AtomicBool::new(false),
             stream: AtomicBool::new(false),
+            wake_pending: AtomicU32::new(0),
+            preroll: AtomicBool::new(true),
             music: AtomicBool::new(false),
             pending_model: Mutex::new(None),
             tap_on: AtomicBool::new(false),
@@ -491,6 +549,15 @@ pub(crate) fn deinterleave(
     }
 }
 
+/// Wake levels for the local endpoint detector on the stream channel, once the window is full.
+/// A partial window would count its zero padding as a -100 dB floor.
+fn endpoint_prior(hist: &[f32; LEVEL_CHUNKS], filled: usize) -> Option<EndpointPrior> {
+    (filled == LEVEL_CHUNKS).then(|| EndpointPrior {
+        noise_db: percentile_db(hist, 0.10),
+        speech_db: wake_level_db(hist),
+    })
+}
+
 /// Mean of the 8 loudest of the last 47 frames (mean squares), in dBFS clamped to -100..0 and
 /// rounded to 0.1 dB: stations compare levels received as "%.1f" text, so ours must be the same
 /// number the peers see, or ties could resolve differently on each side.
@@ -514,6 +581,118 @@ fn mean_square(d: &[f32]) -> f32 {
     (sq / d.len() as f64) as f32
 }
 
+/// The last VQE chunks as s16, for the pre-roll after a wake word.
+pub(crate) struct PrerollRing {
+    buf: Vec<i16>,
+    frame: usize,
+    /// Slot the next chunk goes to.
+    next: usize,
+    filled: usize,
+}
+
+impl PrerollRing {
+    pub(crate) fn new(chunks: usize, frame: usize) -> Self {
+        PrerollRing {
+            buf: vec![0; chunks * frame],
+            frame,
+            next: 0,
+            filled: 0,
+        }
+    }
+
+    fn chunks(&self) -> usize {
+        self.buf.len() / self.frame.max(1)
+    }
+
+    /// Stores one chunk and returns it as s16. A chunk of another length breaks the timeline:
+    /// the ring is cleared and nothing is stored.
+    pub(crate) fn push(&mut self, d: &[f32]) -> Option<&[i16]> {
+        if d.len() != self.frame || self.frame == 0 || self.buf.is_empty() {
+            self.clear();
+            return None;
+        }
+        let at = self.next * self.frame;
+        let slot = &mut self.buf[at..at + self.frame];
+        for (o, &v) in slot.iter_mut().zip(d) {
+            *o = to_s16(v);
+        }
+        self.next = (self.next + 1) % self.chunks();
+        self.filled = (self.filled + 1).min(self.chunks());
+        Some(&self.buf[at..at + self.frame])
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.next = 0;
+        self.filled = 0;
+    }
+
+    /// The last `n` chunks (at most as many as stored), oldest first.
+    pub(crate) fn last(&self, n: usize) -> Vec<i16> {
+        let n = n.min(self.filled);
+        let total = self.chunks();
+        let mut out = Vec::with_capacity(n * self.frame);
+        for k in (1..=n).rev() {
+            let at = (self.next + total - k) % total * self.frame;
+            out.extend_from_slice(&self.buf[at..at + self.frame]);
+        }
+        out
+    }
+}
+
+/// Chunks from the newest entry of the level window back to the last one within
+/// `SPEECH_END_RATIO` of its loudest (0 = the newest itself); None for a silent window.
+fn speech_end_chunks(h: &[f32; LEVEL_CHUNKS], newest: usize) -> Option<usize> {
+    let peak = h.iter().copied().fold(0.0f32, f32::max);
+    if peak <= 0.0 {
+        return None;
+    }
+    let floor = SPEECH_END_RATIO * peak;
+    (0..LEVEL_CHUNKS).find(|&k| h[(newest + LEVEL_CHUNKS - k) % LEVEL_CHUNKS] >= floor)
+}
+
+/// Pre-roll length in chunks for `rule`, given the chunks since the 1st-stage hit.
+fn preroll_chunks(rule: Option<PrerollRule>, first_stage_age: Option<usize>) -> usize {
+    match (rule, first_stage_age) {
+        (None, _) => 0,
+        (Some(PrerollRule::Fixed(n)), _) => n as usize,
+        (Some(PrerollRule::FirstStage { offset, .. }), Some(a)) => {
+            (a as i64 + i64::from(offset)).max(0) as usize
+        }
+        (Some(PrerollRule::FirstStage { fallback, .. }), None) => fallback as usize,
+    }
+}
+
+/// Pre-roll rule for the active detector. The custom Ricardo detector has no stock model
+/// directory, so its id is not `Engine::wake_id` (which still points at the native «Алиса»
+/// model kept for rollback) but the `ricardo` entry of `Model::wake_preroll`.
+fn wake_preroll_rule(model: &Model, shared: &Shared, stock_id: &str) -> Option<PrerollRule> {
+    if !shared.preroll.load(Relaxed) {
+        return None;
+    }
+    let id = if shared.custom.load(Relaxed) {
+        "ricardo"
+    } else {
+        stock_id
+    };
+    model
+        .wake_preroll
+        .iter()
+        .find(|p| p.id == id)
+        .map(|p| p.rule)
+}
+
+/// "-" for None in the "wake timing" log.
+struct Chunks(Option<usize>);
+
+impl std::fmt::Display for Chunks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(n) => write!(f, "{n}"),
+            None => f.write_str("-"),
+        }
+    }
+}
+
 fn processing(
     model: &'static Model,
     mut eng: Engine,
@@ -531,18 +710,29 @@ fn processing(
     // Mean square per VQE frame.
     let mut level_hist = [0f32; LEVEL_CHUNKS];
     let mut level_pos = 0;
+    // The same on VQE_OMNI_WITH_GAIN, the channel the stream (and so the endpoint detector)
+    // carries: the wake prior must not mix channels.
+    let mut gain_hist = [0f32; LEVEL_CHUNKS];
+    let mut gain_pos = 0;
+    let mut gain_filled = 0usize;
     let mut ana = SpectrumAnalyzer::new(model.capture_rate, period);
     if !ana.ok() {
         warn!("music analysis: unsupported capture layout");
     }
     let mut music_was_on = false;
+    let mut custom_failed = false;
+    let frame = eng.frame();
+    let mut ring = PrerollRing::new(PREROLL_CHUNKS, frame);
+    // Chunks since the wake spotter's 1st-stage hit, while its verifier waits.
+    let mut first_stage_age: Option<usize> = None;
 
     while shared.running() {
         let pending = lock(&shared.pending_model).take();
-        if let Some(dir) = pending
-            && !eng.set_wake_model(&dir)
-        {
-            error!("failed to switch wake word model to {}", dir.display());
+        if let Some(dir) = pending {
+            first_stage_age = None;
+            if !eng.set_wake_model(&dir) {
+                error!("failed to switch wake word model to {}", dir.display());
+            }
         }
         // Exactly one VQE chunk.
         {
@@ -569,6 +759,11 @@ fn processing(
             let _ = tx.send(FrontendEvent::Music(mf));
         }
         if !eng.process(&mics, &spk) {
+            ring.clear();
+            // The prior must not span a gap in the audio.
+            gain_hist = [0.0; LEVEL_CHUNKS];
+            gain_pos = 0;
+            gain_filled = 0;
             continue;
         }
 
@@ -582,21 +777,105 @@ fn processing(
             level_pos = (level_pos + 1) % LEVEL_CHUNKS;
         }
 
-        if shared.stream.load(Relaxed)
-            && let Some(d) = eng.output(VQE_OMNI_WITH_GAIN)
-            && !d.is_empty()
-        {
-            let _ = tx.send(FrontendEvent::Audio(d.iter().map(|&v| to_s16(v)).collect()));
-        }
-
-        if shared.detect.load(Relaxed) {
-            let phrases = eng.feed_wake();
-            if !phrases.is_empty() {
-                let level_db = wake_level_db(&level_hist);
-                for phrase in phrases {
-                    let _ = tx.send(FrontendEvent::Wake { phrase, level_db });
+        // Every chunk goes into the ring, so a pre-roll never spans a gap. A `Wake` not yet
+        // handled holds the stream open: the owner switches streaming on only when it handles
+        // the event, and the chunks in between continue the pre-roll. `wake_pending` is read
+        // first: its Acquire pairs with `wake_handled`, after the owner's `set_streaming(true)`.
+        let custom_active = shared.custom.load(Relaxed);
+        let detecting = shared.detect.load(Relaxed);
+        let mut custom_score = None;
+        match eng.output(VQE_OMNI_WITH_GAIN).filter(|d| !d.is_empty()) {
+            Some(d) => {
+                gain_hist[gain_pos] = mean_square(d);
+                gain_pos = (gain_pos + 1) % LEVEL_CHUNKS;
+                gain_filled = (gain_filled + 1).min(LEVEL_CHUNKS);
+                if let Some(slot) = ring.push(d) {
+                    // The Ricardo detector hears the same cleaned chunk as the ring and the
+                    // stock spotter; its confirmation then takes the pre-roll from the ring.
+                    if custom_active && detecting && !custom_failed {
+                        match eng.feed_custom(slot) {
+                            Some(Ok((true, score))) => custom_score = Some(score),
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => {
+                                custom_failed = true;
+                                error!("Ricardo wake word: {e}");
+                            }
+                            None => {
+                                custom_failed = true;
+                                error!("Ricardo wake word: detector is not loaded");
+                            }
+                        }
+                    }
+                    if shared.wake_pending.load(Acquire) > 0 || shared.stream.load(Relaxed) {
+                        let _ = tx.send(FrontendEvent::Audio(slot.to_vec()));
+                    }
                 }
             }
+            None => {
+                ring.clear();
+                // A missing output is a gap: restart the prior window.
+                gain_hist = [0.0; LEVEL_CHUNKS];
+                gain_pos = 0;
+                gain_filled = 0;
+            }
+        }
+
+        if let Some(score) = custom_score {
+            let level_db = wake_level_db(&level_hist);
+            let newest = (level_pos + LEVEL_CHUNKS - 1) % LEVEL_CHUNKS;
+            let speech_end = speech_end_chunks(&level_hist, newest);
+            let endpoint_prior = endpoint_prior(&gain_hist, gain_filled);
+            let rule = wake_preroll_rule(model, shared, "ricardo");
+            let n = preroll_chunks(rule, None).min(PREROLL_CHUNKS);
+            let preroll = ring.last(n);
+            info!(
+                "Ricardo wake word detected (probability {score:.3}); \
+                 wake timing: speech_end={} preroll={}",
+                Chunks(speech_end),
+                preroll.len() / frame
+            );
+            shared.wake_pending.fetch_add(1, Relaxed);
+            let _ = tx.send(FrontendEvent::Wake {
+                phrase: "Рикардо".into(),
+                level_db,
+                preroll,
+                endpoint_prior,
+            });
+        } else if !custom_active && detecting {
+            first_stage_age = first_stage_age.map(|a| a + 1).filter(|&a| a < LEVEL_CHUNKS);
+            let spotted = eng.feed_wake();
+            match spotted.stage {
+                Stage::FirstStageHit => first_stage_age = Some(0),
+                Stage::Rejected => first_stage_age = None,
+                Stage::None => {}
+            }
+            if !spotted.phrases.is_empty() {
+                let level_db = wake_level_db(&level_hist);
+                let newest = (level_pos + LEVEL_CHUNKS - 1) % LEVEL_CHUNKS;
+                let speech_end = speech_end_chunks(&level_hist, newest);
+                let endpoint_prior = endpoint_prior(&gain_hist, gain_filled);
+                let rule = wake_preroll_rule(model, shared, eng.wake_id());
+                let n = preroll_chunks(rule, first_stage_age).min(PREROLL_CHUNKS);
+                let preroll = ring.last(n);
+                info!(
+                    "wake timing: first_stage={} speech_end={} preroll={}",
+                    Chunks(first_stage_age),
+                    Chunks(speech_end),
+                    preroll.len() / frame
+                );
+                first_stage_age = None;
+                for phrase in spotted.phrases {
+                    shared.wake_pending.fetch_add(1, Relaxed);
+                    let _ = tx.send(FrontendEvent::Wake {
+                        phrase,
+                        level_db,
+                        preroll: preroll.clone(),
+                        endpoint_prior,
+                    });
+                }
+            }
+        } else {
+            first_stage_age = None;
         }
         if shared.commands.load(Relaxed) {
             for word in eng.feed_command() {
@@ -634,6 +913,119 @@ mod tests {
         // Clamped to -100..0.
         assert_eq!(wake_level_db(&at(3.0)), 0.0);
         assert_eq!(wake_level_db(&at(-120.0)), -100.0);
+    }
+
+    #[test]
+    fn preroll_ring_keeps_the_last_chunks_oldest_first() {
+        // 3 chunks of 2 samples; chunk k holds the samples k, k.
+        let mut r = PrerollRing::new(3, 2);
+        let chunk = |k: i16| [f32::from(k) / 32768.0; 2];
+        assert!(r.last(2).is_empty());
+        assert_eq!(r.push(&chunk(1)), Some(&[1i16, 1][..]));
+        // Asked for more than stored: what there is.
+        assert_eq!(r.last(3), [1, 1]);
+        for k in 2..=5 {
+            r.push(&chunk(k));
+        }
+        // Wrapped twice: chunks 3, 4, 5 remain.
+        assert_eq!(r.last(3), [3, 3, 4, 4, 5, 5]);
+        assert_eq!(r.last(2), [4, 4, 5, 5]);
+        assert_eq!(r.last(9), [3, 3, 4, 4, 5, 5]);
+        assert!(r.last(0).is_empty());
+        // A chunk of another length breaks the timeline: nothing older survives it.
+        assert_eq!(r.push(&[0.0; 3]), None);
+        assert!(r.last(3).is_empty());
+        r.push(&chunk(6));
+        assert_eq!(r.last(3), [6, 6]);
+    }
+
+    #[test]
+    fn speech_end_is_the_newest_chunk_within_20_db_of_the_peak() {
+        let mut h = [0f32; LEVEL_CHUNKS];
+        assert_eq!(speech_end_chunks(&h, 10), None);
+        // Word in chunks 3..=8, newest = 12: 4 quiet chunks after it.
+        for v in &mut h[3..=8] {
+            *v = 1.0;
+        }
+        h[9] = 0.009;
+        assert_eq!(speech_end_chunks(&h, 12), Some(4));
+        // Exactly 20 dB down still counts as speech.
+        h[9] = 0.01;
+        assert_eq!(speech_end_chunks(&h, 12), Some(3));
+        // The window is a ring: newest = 1 reaches back over the end to the word.
+        assert_eq!(speech_end_chunks(&h, 1), Some(LEVEL_CHUNKS - 9 + 1));
+        assert_eq!(speech_end_chunks(&h, 9), Some(0));
+    }
+
+    #[test]
+    fn preroll_length_per_rule() {
+        let first = |offset, fallback| Some(PrerollRule::FirstStage { offset, fallback });
+        assert_eq!(preroll_chunks(None, Some(5)), 0);
+        assert_eq!(preroll_chunks(Some(PrerollRule::Fixed(7)), None), 7);
+        assert_eq!(preroll_chunks(Some(PrerollRule::Fixed(7)), Some(2)), 7);
+        assert_eq!(preroll_chunks(first(3, 9), Some(4)), 7);
+        assert_eq!(preroll_chunks(first(-3, 9), Some(4)), 1);
+        // An anchor closer than the offset: nothing rather than the word itself.
+        assert_eq!(preroll_chunks(first(-3, 9), Some(2)), 0);
+        // No 1st-stage hit before the confirmation.
+        assert_eq!(preroll_chunks(first(-3, 9), None), 9);
+    }
+
+    #[test]
+    fn ricardo_preroll_rule_uses_the_custom_id() {
+        let midi = model_from_compatible(b"yandex,cucumber\0").unwrap();
+        // The custom detector is active: the stock model id ("alisa", kept for rollback) must
+        // not select the rule, or the Ricardo word loses its pre-roll.
+        let custom = Shared::new(true);
+        assert_eq!(
+            wake_preroll_rule(midi, &custom, "alisa"),
+            Some(PrerollRule::Fixed(8))
+        );
+        // Switched back to a stock spotter: the custom entry no longer applies.
+        let stock = Shared::new(false);
+        assert_eq!(
+            wake_preroll_rule(midi, &stock, "alisa"),
+            Some(PrerollRule::Fixed(2))
+        );
+    }
+
+    #[test]
+    fn ricardo_preroll_is_the_last_256_ms_of_the_ring() {
+        let midi = model_from_compatible(b"yandex,cucumber\0").unwrap();
+        const FRAME: usize = 512; // 16 kHz, one VQE chunk = 32 ms
+        let mut ring = PrerollRing::new(PREROLL_CHUNKS, FRAME);
+        for k in 0..PREROLL_CHUNKS {
+            ring.push(&[k as f32 / 32768.0; FRAME]);
+        }
+        let rule = wake_preroll_rule(midi, &Shared::new(true), "ricardo");
+        let n = preroll_chunks(rule, None);
+        assert_eq!(n, 8);
+        let preroll = ring.last(n);
+        assert_eq!(preroll.len(), n * FRAME);
+        assert_eq!(preroll.len() / 16, 256, "milliseconds at 16 kHz");
+        // Oldest first, ending with the chunk that confirmed the word.
+        assert_eq!(preroll[0], (PREROLL_CHUNKS - n) as i16);
+        assert_eq!(preroll[preroll.len() - 1], (PREROLL_CHUNKS - 1) as i16);
+    }
+
+    #[test]
+    fn preroll_off_is_empty_but_the_wake_hold_is_separate() {
+        let midi = model_from_compatible(b"yandex,cucumber\0").unwrap();
+        let shared = Shared::new(true);
+        shared.preroll.store(false, Relaxed);
+        let n = preroll_chunks(wake_preroll_rule(midi, &shared, "ricardo"), None);
+        assert_eq!(n, 0);
+        let mut ring = PrerollRing::new(PREROLL_CHUNKS, 512);
+        ring.push(&[0.5; 512]);
+        assert!(ring.last(n).is_empty());
+        // `wake_pending` holds the stream open regardless of the pre-roll switch: the owner
+        // raises it for every Wake and lowers it once after `set_streaming`.
+        shared.wake_pending.fetch_add(1, Relaxed);
+        assert_eq!(shared.wake_pending.load(Relaxed), 1);
+        let _ = shared
+            .wake_pending
+            .try_update(AcqRel, Acquire, |v| v.checked_sub(1));
+        assert_eq!(shared.wake_pending.load(Relaxed), 0);
     }
 
     #[test]
@@ -792,7 +1184,7 @@ mod tests {
     fn without_the_yandex_library_the_handle_is_degraded() {
         // No /system/vendor/quasar/libs on the build host: dlopen fails.
         let midi = model_from_compatible(b"yandex,cucumber\0").unwrap();
-        let (h, mut rx) = spawn(midi, PathBuf::from("/nonexistent"), None);
+        let (h, mut rx) = spawn(midi, PathBuf::from("/nonexistent"), None, false, None);
         h.set_streaming(true);
         h.set_model(PathBuf::from("/nonexistent/2"));
         let h2 = h.clone();

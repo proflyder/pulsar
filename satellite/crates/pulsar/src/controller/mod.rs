@@ -32,7 +32,12 @@ use logic::{HaTimer, Phase, RunBinding};
 
 const MODELS: &str = "/system/vendor/quasar/spotter_models/activation/";
 const COMMAND_MODEL: &str = "/system/vendor/quasar/spotter_models/command";
+const RICARDO_MODEL: &str = "/data/pulsar/wakewords/ru_ricardo_mww.tflite";
 const SOUNDS: &str = "/system/vendor/quasar/sounds/";
+
+/// The Ricardo installation uses the station only as an ESPHome/Sendspin endpoint;
+/// the Yandex Zigbee radio stays untouched (the HA Zigbee coordinator is elsewhere).
+const ENABLE_ZIGBEE: bool = false;
 
 const DUCK_GAIN: f32 = 0.15;
 const TIMER_RING_MAX_MS: i64 = 15 * 60 * 1000;
@@ -42,9 +47,10 @@ const TIMER_RING_MAX_MS: i64 = 15 * 60 * 1000;
 // starts), and conversation agents (LLMs with tool calls) may think for a minute or more.
 const LISTEN_TIMEOUT_MS: u64 = 30_000;
 const PROCESS_TIMEOUT_MS: u64 = 120_000;
-// Updates: releases of this repository on GitHub. The first check waits for the network after
-// boot; an automatic install waits until the speaker is idle (it restarts the daemon).
-const UPDATE_REPO: &str = "Morvex885/pulsar";
+// Updates: releases of this fork on GitHub, never upstream. The first check waits for the
+// network after boot; auto_update stays off by default, so a custom binary is not replaced
+// silently.
+const UPDATE_REPO: &str = "proflyder/pulsar";
 const UPDATE_FIRST_CHECK_MS: u64 = 60_000;
 const UPDATE_CHECK_PERIOD_MS: u64 = 6 * 3_600_000;
 const UPDATE_IDLE_RETRY_MS: u64 = 10 * 60_000;
@@ -169,10 +175,15 @@ pub struct Controller {
     arb_phrase: String,
     arb_level: f32,
     arb_audio: Vec<i16>,
-    arb_command: String,
+    /// Samples in `arb_audio` that came with the wake event; the rest arrived after it (live
+    /// post-wake speech held during arbitration).
+    arb_boundary: usize,
+    arb_endpoint: Option<pulsar_audio::endpoint::EndpointPrior>,
     /// Another station answers the wake word just heard.
     commands_blocked_until_ms: i64,
     run: RunBinding,
+    /// Experimental local end-of-utterance detector (opt-in, see `PULSAR_LOCAL_ENDPOINTING`).
+    endpoint: Option<pulsar_audio::endpoint::EndpointRun>,
     /// voice_request_stop already sent for this dialog's run.
     stop_sent: bool,
     /// Id of the last voice_request_start: VoiceStartFailed / VoiceAudioOverflow of another
@@ -247,7 +258,11 @@ fn clock_face_index(name: &str) -> i32 {
 }
 
 fn model_dir(id: &str) -> PathBuf {
-    PathBuf::from(format!("{MODELS}{id}"))
+    if id == "ricardo" {
+        PathBuf::from(RICARDO_MODEL)
+    } else {
+        PathBuf::from(format!("{MODELS}{id}"))
+    }
 }
 
 /// C++ `uint8_t(x * 255)`.
@@ -290,13 +305,26 @@ impl Controller {
             VERSION,
             BUILD_TIME,
         );
-        if st.wake_word != "alisa" && st.wake_word != "yandex" {
-            st.wake_word = "alisa".into();
+        if st.wake_word != "alisa" && st.wake_word != "yandex" && st.wake_word != "ricardo" {
+            st.wake_word = "ricardo".into();
         }
         let case_colors = pulsar_hw::case_colors();
         let dir = logic::state_dir(state_path.as_os_str());
         let strings = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         let with_none = |l: Vec<String>| std::iter::once("None".to_owned()).chain(l).collect();
+        // Opened before the entity list: on a station where the model makes it optional the
+        // Illuminance entity exists only when the sensor is there.
+        let lux_rx = match pulsar_clock::spawn_light_sensor(LUX_PERIOD_MS) {
+            Ok(rx) => Some(rx),
+            Err(e) if model.has_lux => {
+                error!("{e}");
+                None
+            }
+            Err(e) => {
+                info!("{e}");
+                None
+            }
+        };
         let cfg = ApiConfig {
             port: ports.api,
             wake_words: vec![
@@ -310,6 +338,11 @@ impl Controller {
                     phrase: "Яндекс".into(),
                     languages: vec!["ru".into()],
                 },
+                WakeWordInfo {
+                    id: "ricardo".into(),
+                    phrase: "Рикардо".into(),
+                    languages: vec!["ru".into()],
+                },
             ],
             active_wake_words: vec![st.wake_word.clone()],
             light_effects: strings(pulsar_hw::effect_names()),
@@ -317,7 +350,7 @@ impl Controller {
             music_styles: strings(pulsar_hw::music_styles()),
             case_colors: with_none(case_colors.clone()),
             clock_music_styles: strings(pulsar_clock::music_styles()),
-            zigbee_modes: if model.zigbee_tty.is_empty() {
+            zigbee_modes: if !ENABLE_ZIGBEE || model.zigbee_tty.is_empty() {
                 Vec::new()
             } else {
                 pulsar_zigbee::ROLES
@@ -327,7 +360,7 @@ impl Controller {
             },
             key_path: Some(logic::in_dir(&dir, "api_key")),
             has_clock: model.has_clock || pulsar_clock::panel_present(model),
-            has_lux: model.has_lux,
+            has_lux: model.has_lux || lux_rx.is_some(),
         };
         // The C++ server bound its port last (ApiServer::start); here the bind comes first, so
         // a failure exits before the hardware starts. Nothing reaches the server before `run`.
@@ -418,16 +451,20 @@ impl Controller {
             }
         };
         let hw_mic_muted = input.as_ref().is_some_and(InputHandle::hw_muted);
-        let lux_rx = if model.has_lux {
-            pulsar_clock::spawn_light_sensor(LUX_PERIOD_MS).ok()
-        } else {
-            None
-        };
+        let custom_wake = st.wake_word == "ricardo";
         let (mic, mic_rx) = pulsar_audio::spawn(
             model,
-            model_dir(&st.wake_word),
+            if custom_wake {
+                // Native spotters stay available for a rollback to «Алиса»/«Яндекс».
+                model_dir("alisa")
+            } else {
+                model_dir(&st.wake_word)
+            },
+            Some(PathBuf::from(RICARDO_MODEL)),
+            custom_wake,
             Some(PathBuf::from(COMMAND_MODEL)),
         );
+        mic.set_preroll(st.wake_preroll);
 
         let ss_cfg = SendspinConfig {
             name: id.friendly_name.clone(),
@@ -480,7 +517,7 @@ impl Controller {
             None
         };
 
-        let (zigbee, zigbee_rx) = if model.zigbee_tty.is_empty() {
+        let (zigbee, zigbee_rx) = if !ENABLE_ZIGBEE || model.zigbee_tty.is_empty() {
             (None, None)
         } else {
             let zcfg = ZigbeeConfig {
@@ -559,9 +596,11 @@ impl Controller {
             arb_phrase: String::new(),
             arb_level: -100.0,
             arb_audio: Vec::new(),
-            arb_command: String::new(),
+            arb_boundary: 0,
+            arb_endpoint: None,
             commands_blocked_until_ms: 0,
             run: RunBinding::default(),
+            endpoint: None,
             stop_sent: false,
             voice_run: 0,
             tts_url: String::new(),
@@ -745,11 +784,20 @@ impl Controller {
 
     fn on_frontend(&mut self, ev: FrontendEvent) {
         match ev {
-            FrontendEvent::Wake { phrase, level_db } => self.on_wake(&phrase, level_db),
-            FrontendEvent::Command { word } => self.on_command(&word, false),
+            FrontendEvent::Wake {
+                phrase,
+                level_db,
+                preroll,
+                endpoint_prior,
+            } => {
+                self.on_wake(&phrase, level_db, preroll, endpoint_prior);
+                // After on_wake has switched streaming on where the wake word starts a request.
+                self.mic.wake_handled();
+            }
+            FrontendEvent::Command { word } => self.on_command(&word),
             FrontendEvent::Audio(pcm) => {
                 if self.phase == Phase::Listening {
-                    self.api.voice_send_audio(pcm);
+                    self.on_listening_audio(pcm);
                 } else if self.arbitrating {
                     // The request goes on with what was said right after the wake word.
                     self.arb_audio.extend_from_slice(&pcm);
@@ -782,6 +830,15 @@ impl Controller {
     /// more.
     pub fn flush_settings(&mut self) {
         self.state.flush(&self.st);
+    }
+
+    /// The supervisor will start this daemon again (the `enabled` file exists): promise the
+    /// Sendspin server a reconnect before the client stops, otherwise its stop() sends
+    /// `shutdown` and Music Assistant deliberately stops redialing this player.
+    pub fn promise_sendspin_restart(&self) {
+        if let Some(ss) = &self.sendspin {
+            ss.goodbye_restart();
+        }
     }
 
     fn mic_muted(&self) -> bool {

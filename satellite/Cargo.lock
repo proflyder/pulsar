@@ -300,6 +300,7 @@ dependencies = [
 name = "pulsar-audio"
 version = "0.0.0"
 dependencies = [
+ "cc",
  "libc",
  "libloading",
  "log",

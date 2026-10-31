@@ -60,6 +60,8 @@ pub struct Settings {
     pub led_speed: f32,
     /// Listening / thinking / speaking shown on the ring and the clock.
     pub voice_indication: bool,
+    /// Audio between the end of the wake word and its confirmation goes ahead of the request.
+    pub wake_preroll: bool,
     /// Stem of `pulsar_hw::case_colors()`, "" = none.
     pub led_case_color: String,
     /// Release being installed. Still set after a restart into another version: that release
@@ -84,14 +86,16 @@ impl Default for Settings {
             clock_brightness: 1.0,
             clock_scroll_ms: 400,
             light: LightState::default(),
-            wake_word: "alisa".into(),
+            wake_word: "ricardo".into(),
             tz: "MSK-3".into(),
             auto_update: false,
-            nearest_answers: true,
+            // One station in this installation: the 250 ms arbitration window only adds latency.
+            nearest_answers: false,
             music_viz: "All styles".into(),
             clock_music: "Off".into(),
             led_speed: 1.0,
             voice_indication: true,
+            wake_preroll: true,
             led_case_color: String::new(),
             update_attempt: String::new(),
             zigbee_role: Mode::Off,
@@ -163,6 +167,7 @@ impl Settings {
                     };
                 }
                 b"voice_indication" => self.voice_indication = on,
+                b"wake_preroll" => self.wake_preroll = on,
                 b"led_case_color" => self.led_case_color = v,
                 _ => {}
             }
@@ -184,7 +189,8 @@ impl Settings {
              clock_scroll_ms={}\nlight_on={}\nlight_brightness={}\nlight_r={}\nlight_g={}\n\
              light_b={}\nlight_effect={}\nwake_word={}\ntz={}\nauto_update={}\nupdate_attempt={}\n\
              zigbee_role={}\nzigbee_flash_failed={:x}\nnearest_answers={}\nmusic_viz={}\n\
-             led_speed={}\nvoice_indication={}\nled_case_color={}\nclock_music={}\n",
+             led_speed={}\nvoice_indication={}\nled_case_color={}\nclock_music={}\n\
+             wake_preroll={}\n",
             f(self.volume),
             f(self.volume_legacy),
             b(self.muted),
@@ -210,6 +216,7 @@ impl Settings {
             b(self.voice_indication),
             self.led_case_color,
             self.clock_music,
+            b(self.wake_preroll),
         )
     }
 

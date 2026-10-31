@@ -185,9 +185,14 @@ pub(crate) struct Shared {
 }
 
 pub(crate) enum Cmd {
-    VoiceRequestStart { run: u64, phrase: String },
+    VoiceRequestStart {
+        run: u64,
+        phrase: String,
+    },
     VoiceRequestStop,
     VoiceSendAudio(Vec<i16>),
+    /// VoiceAssistantAudio{end=true}: graceful end of the audio stream, not an abort.
+    VoiceAudioEnd,
     VoiceAnnounceFinished(bool),
     VoiceAnswerFinished(bool),
     SetActiveWakeWords(Vec<String>),
@@ -1413,10 +1418,14 @@ impl Server {
         match cmd {
             Cmd::VoiceRequestStart { run, phrase } => self.voice_request_start(run, &phrase),
             // Stale: meant for the run of the previous owner.
-            Cmd::VoiceRequestStop | Cmd::VoiceSendAudio(_) | Cmd::VoiceAnswerFinished(_)
+            Cmd::VoiceRequestStop
+            | Cmd::VoiceSendAudio(_)
+            | Cmd::VoiceAudioEnd
+            | Cmd::VoiceAnswerFinished(_)
                 if self.voice_stale => {}
             Cmd::VoiceRequestStop => self.voice_request_stop(),
             Cmd::VoiceSendAudio(pcm) => self.voice_send_audio(&pcm),
+            Cmd::VoiceAudioEnd => self.voice_send_audio_end(),
             Cmd::VoiceAnnounceFinished(success) | Cmd::VoiceAnswerFinished(success) => {
                 self.voice_announce_finished(success);
             }
@@ -1476,6 +1485,18 @@ impl Server {
         }
         let mut w = Writer::new();
         w.pcm16(1, pcm);
+        self.send_msg(vc, msg::VA_AUDIO, &w);
+    }
+
+    /// `VoiceAssistantAudio{end = true}` with no data: the graceful "the talker finished"
+    /// signal (aioesphomeapi `handle_stop(False)`), distinct from the aborting
+    /// `VoiceAssistantRequest{start = false}` of [`Self::voice_request_stop`].
+    fn voice_send_audio_end(&mut self) {
+        let Some(vc) = self.voice_client() else {
+            return;
+        };
+        let mut w = Writer::new();
+        w.boolean(2, true, false);
         self.send_msg(vc, msg::VA_AUDIO, &w);
     }
 

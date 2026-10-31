@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main, rust]
+    branches: [main]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -200,5 +200,19 @@ jobs:
             satellite/deploy/dist.sh "pulsar-${t%%:*}.tar.gz" "artifacts/installer/${t#*:}/pulsar-install"
           done
           sha256sum pulsar-*.bin zigbee-*.ybl pulsar-*.zip pulsar-*.tar.gz > SHA256SUMS
+          # `--latest`: the daemon finds the release through releases/latest.
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
-            pulsar-*.bin pulsar-*.debug zigbee-*.ybl pulsar-*.zip pulsar-*.tar.gz SHA256SUMS
+            --latest pulsar-*.bin pulsar-*.debug zigbee-*.ybl pulsar-*.zip pulsar-*.tar.gz SHA256SUMS
+
+  deploy:
+    # The release is published first; the install itself waits for a human
+    # approval on the `Station` Environment in deploy-station.yml.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release]
+    permissions:
+      contents: read
+      id-token: write # OpenBao GitHub OIDC login in the called workflow
+    uses: ./.github/workflows/deploy-station.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

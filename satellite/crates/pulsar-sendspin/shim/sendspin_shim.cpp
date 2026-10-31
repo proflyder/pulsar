@@ -376,6 +376,16 @@ void ss_leave(ss_client *c) {
   }
 }
 
+void ss_disconnect_restart(ss_client *c) {
+  if (!c) return;
+  try {
+    // Posts the request; the client's stop() final tick applies it before its shutdown pass
+    // would send reason "shutdown" for every connection still open.
+    c->client.disconnect(ss::SendspinGoodbyeReason::RESTART);
+  } catch (...) {
+  }
+}
+
 void ss_confirm_pairing_window(ss_client *c) {
   try {
     c->client.confirm_pairing_window();

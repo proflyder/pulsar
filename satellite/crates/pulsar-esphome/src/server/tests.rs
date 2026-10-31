@@ -542,6 +542,11 @@ async fn voice_owner_hands_over() {
             h.voice_send_audio(vec![1, -2]);
             let m = b.expect(msg::VA_AUDIO).await;
             assert_eq!(field(&m, 1).unwrap().data, [1, 0, 0xfe, 0xff]);
+            // Graceful end: VoiceAssistantAudio.end = true, no data. Not a stop request.
+            h.voice_send_audio_end();
+            let m = b.expect(msg::VA_AUDIO).await;
+            assert!(field(&m, 1).is_none());
+            assert!(field(&m, 2).unwrap().boolean());
             h.voice_announce_finished(true);
             let m = b.expect(msg::VA_ANNOUNCE_FINISHED).await;
             assert!(field(&m, 1).unwrap().boolean());
@@ -577,6 +582,7 @@ async fn voice_owner_hands_over() {
             // Without an owner the voice calls send nothing.
             h.voice_request_start("x");
             h.voice_send_audio(vec![1]);
+            h.voice_send_audio_end();
             h.voice_request_stop();
             assert!(a.sync().await.is_empty());
 

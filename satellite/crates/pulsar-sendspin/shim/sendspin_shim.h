@@ -141,6 +141,9 @@ void ss_player_update_volume(ss_client *c, uint8_t volume);
 void ss_player_update_muted(ss_client *c, bool muted);
 bool ss_controller_send(ss_client *c, uint8_t command);  // SS_CMD_*
 void ss_leave(ss_client *c);
+// client/goodbye with reason "restart": the daemon restarts and will reconnect. For a daemon
+// that is deliberately stopped (enabled file removed), let stop() send "shutdown" instead.
+void ss_disconnect_restart(ss_client *c);
 void ss_confirm_pairing_window(ss_client *c);
 // Inside load_blob only: stores the loaded bytes. false: out of memory.
 bool ss_blob_set(ss_blob *blob, const uint8_t *data, size_t len);

@@ -1,0 +1,244 @@
+name: deploy-station
+
+# Install an already published release on the station through Home Assistant.
+#
+# Nothing is built here: `build.yml` publishes the release on a `v*` tag and
+# then calls this workflow. The `Station` Environment needs a required reviewer,
+# so the install only runs after a human approved that run in the GitHub UI.
+# `workflow_dispatch` re-runs an install for a release that already exists.
+#
+# Secrets (Environment `Station`): VPN_SERVER, VPN_CERT_P12_B64,
+# VPN_CERT_PASSWORD, OPENBAO_ADDR, optional OPENBAO_ROLE (default
+# `deploy-station`). Everything needed *after* the VPN is up (HA URL, token,
+# entity) lives in OpenBao `secret/data/ci/deploy-station`; the token is revoked
+# in an `if: always()` step and never printed.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to install (for example v0.5.1001)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to install (must have a published GitHub release)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: station-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # A human approves the deployment here; this is the only gate before the
+    # station is touched. The tag rule `v*` belongs to the Environment.
+    environment: Station
+    permissions:
+      contents: read
+      id-token: write # OpenBao auth/github OIDC (audience = OPENBAO_ADDR)
+    env:
+      TAG: ${{ inputs.tag }}
+      VPN_SERVER: ${{ secrets.VPN_SERVER }}
+      IN_VPN_CERT_P12_B64: ${{ secrets.VPN_CERT_P12_B64 }}
+      IN_VPN_CERT_PASSWORD: ${{ secrets.VPN_CERT_PASSWORD }}
+      OPENBAO_ADDR: ${{ secrets.OPENBAO_ADDR }}
+      OPENBAO_ROLE: ${{ secrets.OPENBAO_ROLE || 'deploy-station' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$TAG' is not a release tag (vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          # The station's updater only reaches releases/latest, so the release
+          # must already exist and be a stable one.
+          if ! release=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,isPrerelease 2>/dev/null); then
+            echo "::error::no GitHub release for $TAG"
+            exit 1
+          fi
+          verdict=$(RELEASE="$release" TAG="$TAG" python3 - <<'PY'
+          import json, os
+          release = json.loads(os.environ["RELEASE"])
+          tag = os.environ["TAG"]
+          if release.get("isDraft"):
+              print(f"release {tag} is a draft")
+          elif release.get("isPrerelease"):
+              print(f"release {tag} is a prerelease")
+          else:
+              print("")
+          PY
+          )
+          if [[ -n "$verdict" ]]; then
+            echo "::error::$verdict"
+            exit 1
+          fi
+          echo "release $TAG is published and stable"
+
+      - name: Install openconnect
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends openconnect vpnc-scripts
+
+      - name: Materialise VPN credentials
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          CI_DIR="$RUNNER_TEMP/ci"
+          rm -rf "$CI_DIR"
+          mkdir -p "$CI_DIR"
+          chmod 700 "$CI_DIR"
+          printf '%s' "$IN_VPN_CERT_P12_B64" | base64 -d > "$CI_DIR/ci.p12"
+          printf '%s' "$IN_VPN_CERT_PASSWORD" > "$CI_DIR/ci.pass"
+          chmod 600 "$CI_DIR"/*
+          echo "VPN credentials prepared"
+
+      - name: Connect VPN (group ci)
+        run: |
+          set -euo pipefail
+          CI_DIR="$RUNNER_TEMP/ci"
+          test -n "$OPENBAO_ADDR"
+          # shellcheck disable=SC2024 # the log is user-writable; only openconnect is root
+          sudo openconnect \
+            --no-dtls \
+            --certificate "$CI_DIR/ci.p12" \
+            --passwd-on-stdin \
+            --authgroup ci \
+            --pid-file "$RUNNER_TEMP/openconnect.pid" \
+            "${VPN_SERVER%/}" \
+            < "$CI_DIR/ci.pass" > "$RUNNER_TEMP/openconnect.log" 2>&1 &
+          # The ci group routes only the K3s node; OpenBao health on 443 is the
+          # first service this job needs.
+          for _ in $(seq 1 30); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+              "$OPENBAO_ADDR/v1/sys/health" || true)
+            if [[ -n "$code" && "$code" != "000" ]]; then
+              echo "OpenBao reachable over the VPN"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "OpenBao is not reachable over the VPN" >&2
+          tail -n 40 "$RUNNER_TEMP/openconnect.log" >&2 || true
+          exit 1
+
+      - name: Read deploy secrets from OpenBao
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          CI_DIR="$RUNNER_TEMP/ci"
+          test -n "$OPENBAO_ADDR"
+          oidc=$(curl -sSf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OPENBAO_ADDR" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')
+          echo "::add-mask::$oidc"
+          python3 - "$oidc" "$OPENBAO_ROLE" "$CI_DIR/login.json" <<'PY'
+          import json, sys
+          oidc, role, path = sys.argv[1:4]
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump({"role": role, "jwt": oidc}, handle)
+          PY
+          chmod 600 "$CI_DIR/login.json"
+          code=$(curl -sS -o "$CI_DIR/login-response.json" -w '%{http_code}' \
+            -X POST --data-binary "@$CI_DIR/login.json" \
+            "$OPENBAO_ADDR/v1/auth/github/login")
+          if [[ "$code" != "200" ]]; then
+            echo "OpenBao GitHub login failed with HTTP $code" >&2
+            exit 1
+          fi
+          python3 - "$CI_DIR/login-response.json" "$CI_DIR/openbao-token" <<'PY'
+          import json, os, sys
+          token = json.load(open(sys.argv[1], encoding="utf-8"))["auth"]["client_token"]
+          with open(sys.argv[2], "w", encoding="utf-8") as handle:
+              handle.write(token)
+          os.chmod(sys.argv[2], 0o600)
+          print(f"::add-mask::{token}")
+          PY
+          rm -f "$CI_DIR/login.json" "$CI_DIR/login-response.json"
+          code=$(curl -sS -o "$CI_DIR/deploy-station.json" -w '%{http_code}' \
+            -H "X-Vault-Token: $(cat "$CI_DIR/openbao-token")" \
+            "$OPENBAO_ADDR/v1/secret/data/ci/deploy-station")
+          if [[ "$code" != "200" ]]; then
+            echo "read secret/ci/deploy-station failed with HTTP $code" >&2
+            exit 1
+          fi
+          # KV v2 payload: {"data": {"data": {"ha_url": ..., "ha_token": ..., ...}}}.
+          # One file per value keeps them out of the command line and the logs.
+          python3 - "$CI_DIR/deploy-station.json" "$CI_DIR" <<'PY'
+          import json, os, sys
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          data = payload["data"]["data"]
+          for key in ("ha_url", "ha_token", "entity_id"):
+              value = data[key]
+              path = os.path.join(sys.argv[2], key)
+              with open(path, "w", encoding="utf-8") as handle:
+                  handle.write(value)
+              os.chmod(path, 0o600)
+              print(f"::add-mask::{value}")
+          PY
+          rm -f "$CI_DIR/deploy-station.json"
+          echo "deploy secrets prepared"
+
+      - name: Install ${{ inputs.tag }} through Home Assistant
+        run: |
+          set +e
+          set -o pipefail
+          CI_DIR="$RUNNER_TEMP/ci"
+          HA_URL="$(cat "$CI_DIR/ha_url")" \
+          HA_TOKEN="$(cat "$CI_DIR/ha_token")" \
+          ENTITY_ID="$(cat "$CI_DIR/entity_id")" \
+            python3 tools/ha_firmware_deploy.py --tag "$TAG" 2>&1 \
+            | tee "$CI_DIR/deploy.log"
+          status=$?
+          {
+            echo "### Station deploy"
+            echo
+            echo "- tag: \`$TAG\`"
+            if grep -q 'already installed' "$CI_DIR/deploy.log"; then
+              echo "- result: already installed"
+            else
+              grep -E 'done: before=|^error:' "$CI_DIR/deploy.log" | sed 's/^/- /' || true
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Revoke OpenBao token
+        if: always()
+        run: |
+          set +e
+          CI_DIR="$RUNNER_TEMP/ci"
+          if [[ -s "$CI_DIR/openbao-token" ]]; then
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+              -X POST -H "X-Vault-Token: $(cat "$CI_DIR/openbao-token")" \
+              "$OPENBAO_ADDR/v1/auth/token/revoke-self")
+            echo "OpenBao token revocation attempted (HTTP $code)"
+            rm -f "$CI_DIR/openbao-token"
+          fi
+
+      - name: Disconnect VPN and remove temporary files
+        if: always()
+        run: |
+          set +e
+          CI_DIR="$RUNNER_TEMP/ci"
+          if [[ -f "$RUNNER_TEMP/openconnect.pid" ]]; then
+            sudo kill "$(sudo cat "$RUNNER_TEMP/openconnect.pid")" 2>/dev/null
+          fi
+          sudo pkill -f 'openconnect --no-dtls' 2>/dev/null
+          rm -rf "$CI_DIR" "$RUNNER_TEMP/openconnect.log" "$RUNNER_TEMP/openconnect.pid"
+          echo "temporary deploy files removed"
