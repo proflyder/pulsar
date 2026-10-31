@@ -311,8 +311,9 @@ println!("cargo:rustc-link-lib=c++");
   microfrontend, `libtflite.so` с Yandex FULL resolver, модель
   `/data/pulsar/wakewords/ru_ricardo_mww.tflite`. Rust-сторона (`src/ricardo.rs`)
   владеет только opaque handle; `frontend` подаёт детектору тот же очищенный чанк, что и
-  нативному спотеру, и берёт пре-ролл из общего кольца (для id `ricardo` — `Fixed(16)`,
-  512 мс: базовая длина ~0.5 с deployed Rust-сборки; настройка на железе — впереди). Без
+  нативному спотеру, и берёт пре-ролл из общего кольца (для id `ricardo` — `Fixed(8)`,
+  256 мс: минимальный front cut, на котором три реальные команды распознались точно в
+  sweep 2026-10-30 на v27/Midi, n=3; эмпирика, не гарантия для других команд). Без
   модели или `libtflite.so` детектор логирует ошибку и не даёт wake-событий; остальной
   фронтенд не падает.
 - `stats()` / `set_raw_tap()` — только для `frontend_probe`: счётчики потоков и сырой захват для

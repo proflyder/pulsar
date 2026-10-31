@@ -24,6 +24,7 @@ use pulsar_core::MusicFrame;
 use pulsar_core::model::{Model, PrerollRule};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+use crate::endpoint::{EndpointPrior, percentile_db};
 use crate::engine::{Engine, Stage, VQE_OMNI, VQE_OMNI_WITH_GAIN, to_s16};
 use crate::spectrum::SpectrumAnalyzer;
 
@@ -59,6 +60,9 @@ pub enum FrontendEvent {
         /// The `Audio` events after it continue it without a gap until
         /// [`FrontendHandle::wake_handled`].
         preroll: Vec<i16>,
+        /// Levels of the wake window on the same channel as `Audio`, for the experimental
+        /// local endpoint detector. None until a full window was seen.
+        endpoint_prior: Option<EndpointPrior>,
     },
     Command {
         word: String,
@@ -545,6 +549,15 @@ pub(crate) fn deinterleave(
     }
 }
 
+/// Wake levels for the local endpoint detector on the stream channel, once the window is full.
+/// A partial window would count its zero padding as a -100 dB floor.
+fn endpoint_prior(hist: &[f32; LEVEL_CHUNKS], filled: usize) -> Option<EndpointPrior> {
+    (filled == LEVEL_CHUNKS).then(|| EndpointPrior {
+        noise_db: percentile_db(hist, 0.10),
+        speech_db: wake_level_db(hist),
+    })
+}
+
 /// Mean of the 8 loudest of the last 47 frames (mean squares), in dBFS clamped to -100..0 and
 /// rounded to 0.1 dB: stations compare levels received as "%.1f" text, so ours must be the same
 /// number the peers see, or ties could resolve differently on each side.
@@ -697,6 +710,11 @@ fn processing(
     // Mean square per VQE frame.
     let mut level_hist = [0f32; LEVEL_CHUNKS];
     let mut level_pos = 0;
+    // The same on VQE_OMNI_WITH_GAIN, the channel the stream (and so the endpoint detector)
+    // carries: the wake prior must not mix channels.
+    let mut gain_hist = [0f32; LEVEL_CHUNKS];
+    let mut gain_pos = 0;
+    let mut gain_filled = 0usize;
     let mut ana = SpectrumAnalyzer::new(model.capture_rate, period);
     if !ana.ok() {
         warn!("music analysis: unsupported capture layout");
@@ -742,6 +760,10 @@ fn processing(
         }
         if !eng.process(&mics, &spk) {
             ring.clear();
+            // The prior must not span a gap in the audio.
+            gain_hist = [0.0; LEVEL_CHUNKS];
+            gain_pos = 0;
+            gain_filled = 0;
             continue;
         }
 
@@ -762,8 +784,11 @@ fn processing(
         let custom_active = shared.custom.load(Relaxed);
         let detecting = shared.detect.load(Relaxed);
         let mut custom_score = None;
-        match eng.output(VQE_OMNI_WITH_GAIN) {
+        match eng.output(VQE_OMNI_WITH_GAIN).filter(|d| !d.is_empty()) {
             Some(d) => {
+                gain_hist[gain_pos] = mean_square(d);
+                gain_pos = (gain_pos + 1) % LEVEL_CHUNKS;
+                gain_filled = (gain_filled + 1).min(LEVEL_CHUNKS);
                 if let Some(slot) = ring.push(d) {
                     // The Ricardo detector hears the same cleaned chunk as the ring and the
                     // stock spotter; its confirmation then takes the pre-roll from the ring.
@@ -786,13 +811,20 @@ fn processing(
                     }
                 }
             }
-            None => ring.clear(),
+            None => {
+                ring.clear();
+                // A missing output is a gap: restart the prior window.
+                gain_hist = [0.0; LEVEL_CHUNKS];
+                gain_pos = 0;
+                gain_filled = 0;
+            }
         }
 
         if let Some(score) = custom_score {
             let level_db = wake_level_db(&level_hist);
             let newest = (level_pos + LEVEL_CHUNKS - 1) % LEVEL_CHUNKS;
             let speech_end = speech_end_chunks(&level_hist, newest);
+            let endpoint_prior = endpoint_prior(&gain_hist, gain_filled);
             let rule = wake_preroll_rule(model, shared, "ricardo");
             let n = preroll_chunks(rule, None).min(PREROLL_CHUNKS);
             let preroll = ring.last(n);
@@ -807,6 +839,7 @@ fn processing(
                 phrase: "Рикардо".into(),
                 level_db,
                 preroll,
+                endpoint_prior,
             });
         } else if !custom_active && detecting {
             first_stage_age = first_stage_age.map(|a| a + 1).filter(|&a| a < LEVEL_CHUNKS);
@@ -820,6 +853,7 @@ fn processing(
                 let level_db = wake_level_db(&level_hist);
                 let newest = (level_pos + LEVEL_CHUNKS - 1) % LEVEL_CHUNKS;
                 let speech_end = speech_end_chunks(&level_hist, newest);
+                let endpoint_prior = endpoint_prior(&gain_hist, gain_filled);
                 let rule = wake_preroll_rule(model, shared, eng.wake_id());
                 let n = preroll_chunks(rule, first_stage_age).min(PREROLL_CHUNKS);
                 let preroll = ring.last(n);
@@ -836,6 +870,7 @@ fn processing(
                         phrase,
                         level_db,
                         preroll: preroll.clone(),
+                        endpoint_prior,
                     });
                 }
             }
@@ -944,7 +979,7 @@ mod tests {
         let custom = Shared::new(true);
         assert_eq!(
             wake_preroll_rule(midi, &custom, "alisa"),
-            Some(PrerollRule::Fixed(16))
+            Some(PrerollRule::Fixed(8))
         );
         // Switched back to a stock spotter: the custom entry no longer applies.
         let stock = Shared::new(false);
@@ -955,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn ricardo_preroll_is_the_last_512_ms_of_the_ring() {
+    fn ricardo_preroll_is_the_last_256_ms_of_the_ring() {
         let midi = model_from_compatible(b"yandex,cucumber\0").unwrap();
         const FRAME: usize = 512; // 16 kHz, one VQE chunk = 32 ms
         let mut ring = PrerollRing::new(PREROLL_CHUNKS, FRAME);
@@ -964,10 +999,10 @@ mod tests {
         }
         let rule = wake_preroll_rule(midi, &Shared::new(true), "ricardo");
         let n = preroll_chunks(rule, None);
-        assert_eq!(n, 16);
+        assert_eq!(n, 8);
         let preroll = ring.last(n);
         assert_eq!(preroll.len(), n * FRAME);
-        assert_eq!(preroll.len() / 16, 512, "milliseconds at 16 kHz");
+        assert_eq!(preroll.len() / 16, 256, "milliseconds at 16 kHz");
         // Oldest first, ending with the chunk that confirmed the word.
         assert_eq!(preroll[0], (PREROLL_CHUNKS - n) as i16);
         assert_eq!(preroll[preroll.len() - 1], (PREROLL_CHUNKS - 1) as i16);

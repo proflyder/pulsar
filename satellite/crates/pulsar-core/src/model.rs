@@ -149,11 +149,12 @@ const CUCUMBER_PREROLL: &[WakePreroll] = &[
         rule: PrerollRule::Fixed(2),
     },
     // The fork's own «Рикардо» microWakeWord detector (no stock model directory, so the
-    // front-end looks it up under this id). 16 chunks = 512 ms preserves the deployed fork's
-    // ~0.5 s pre-roll baseline, ending at the confirming chunk; hardware tuning is pending.
+    // front-end looks it up under this id). 8 chunks = 256 ms: the smallest relative front cut
+    // that removed the wake remnant while all three commands transcribed exactly in the
+    // 2026-10-30 v27/Midi capture sweep (n=3, empirical; not a guarantee for other commands).
     WakePreroll {
         id: "ricardo",
-        rule: PrerollRule::Fixed(16),
+        rule: PrerollRule::Fixed(8),
     },
 ];
 // Lite 2, frontend_probe 2026-10-28, one talker at 1-2 m: both models confirm with event 2

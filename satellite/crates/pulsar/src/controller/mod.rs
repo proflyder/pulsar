@@ -175,9 +175,15 @@ pub struct Controller {
     arb_phrase: String,
     arb_level: f32,
     arb_audio: Vec<i16>,
+    /// Samples in `arb_audio` that came with the wake event; the rest arrived after it (live
+    /// post-wake speech held during arbitration).
+    arb_boundary: usize,
+    arb_endpoint: Option<pulsar_audio::endpoint::EndpointPrior>,
     /// Another station answers the wake word just heard.
     commands_blocked_until_ms: i64,
     run: RunBinding,
+    /// Experimental local end-of-utterance detector (opt-in, see `PULSAR_LOCAL_ENDPOINTING`).
+    endpoint: Option<pulsar_audio::endpoint::EndpointRun>,
     /// voice_request_stop already sent for this dialog's run.
     stop_sent: bool,
     /// Id of the last voice_request_start: VoiceStartFailed / VoiceAudioOverflow of another
@@ -590,8 +596,11 @@ impl Controller {
             arb_phrase: String::new(),
             arb_level: -100.0,
             arb_audio: Vec::new(),
+            arb_boundary: 0,
+            arb_endpoint: None,
             commands_blocked_until_ms: 0,
             run: RunBinding::default(),
+            endpoint: None,
             stop_sent: false,
             voice_run: 0,
             tts_url: String::new(),
@@ -779,15 +788,16 @@ impl Controller {
                 phrase,
                 level_db,
                 preroll,
+                endpoint_prior,
             } => {
-                self.on_wake(&phrase, level_db, preroll);
+                self.on_wake(&phrase, level_db, preroll, endpoint_prior);
                 // After on_wake has switched streaming on where the wake word starts a request.
                 self.mic.wake_handled();
             }
             FrontendEvent::Command { word } => self.on_command(&word),
             FrontendEvent::Audio(pcm) => {
                 if self.phase == Phase::Listening {
-                    self.api.voice_send_audio(pcm);
+                    self.on_listening_audio(pcm);
                 } else if self.arbitrating {
                     // The request goes on with what was said right after the wake word.
                     self.arb_audio.extend_from_slice(&pcm);

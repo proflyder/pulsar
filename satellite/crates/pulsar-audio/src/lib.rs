@@ -6,6 +6,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+pub mod endpoint;
 pub mod engine;
 mod frontend;
 #[allow(unsafe_code)]

@@ -96,6 +96,14 @@ impl ApiHandle {
         self.send(Cmd::VoiceSendAudio(pcm));
     }
 
+    /// Graceful end of the microphone audio (`VoiceAssistantAudio.end = true`). Home Assistant
+    /// treats it as `handle_stop(False)` and finishes the current stage on what it already has,
+    /// unlike [`Self::voice_request_stop`], which sends `VoiceAssistantRequest.start = false`
+    /// (an abort). The detector in the controller sends at most one per dialog.
+    pub fn voice_send_audio_end(&self) {
+        self.send(Cmd::VoiceAudioEnd);
+    }
+
     /// VoiceAssistantAnnounceFinished for an HA announcement.
     pub fn voice_announce_finished(&self, success: bool) {
         self.send(Cmd::VoiceAnnounceFinished(success));

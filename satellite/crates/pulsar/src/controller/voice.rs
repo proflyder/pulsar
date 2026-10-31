@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use log::{debug, info, warn};
+use pulsar_audio::endpoint::{EndpointPrior, EndpointRun, pcm_level_db};
 use pulsar_core::{ClockShot, UiState, now_ms};
 use pulsar_esphome::{AnnounceRequest, TimerEvent, TimerInfo, VaEvent};
 use pulsar_lan::arbiter::Claim;
@@ -53,7 +54,7 @@ impl Controller {
                         && !self.timer_ringing
                         && !self.mic_muted()
                     {
-                        self.start_pipeline("", false, Vec::new());
+                        self.start_pipeline("", false, Vec::new(), Vec::new(), None);
                     }
                     self.end_announce();
                 }
@@ -107,7 +108,13 @@ impl Controller {
 
     // ---------------- wake word ----------------
 
-    pub(super) fn on_wake(&mut self, phrase: &str, level_db: f32, preroll: Vec<i16>) {
+    pub(super) fn on_wake(
+        &mut self,
+        phrase: &str,
+        level_db: f32,
+        preroll: Vec<i16>,
+        endpoint_prior: Option<EndpointPrior>,
+    ) {
         if self.mic_muted() {
             return;
         }
@@ -131,7 +138,7 @@ impl Controller {
         }
         // Without the HA pipeline this station could win and stay silent: it does not take part.
         if !self.arbitration_on() || !self.api.voice_subscribed() {
-            return self.answer_wake(phrase, preroll);
+            return self.answer_wake(phrase, preroll, Vec::new(), endpoint_prior);
         }
         self.arbitrating = true;
         // A station that lost the previous wake word may win this one.
@@ -139,13 +146,23 @@ impl Controller {
         self.arb_phrase = phrase.to_owned();
         self.arb_level = level_db;
         self.arb_audio = preroll;
+        // Everything after this point is live post-wake speech held during the decision; the
+        // detector must not treat it as pre-roll evidence.
+        self.arb_boundary = self.arb_audio.len();
+        self.arb_endpoint = endpoint_prior;
         self.mic.set_streaming(true);
         self.update_ui();
         let busy = self.phase == Phase::Speaking || self.announcing;
         self.arb_claim = Some(self.arbiter.claim(&self.st.wake_word, level_db, busy, true));
     }
 
-    fn answer_wake(&mut self, phrase: &str, preroll: Vec<i16>) {
+    fn answer_wake(
+        &mut self,
+        phrase: &str,
+        preroll: Vec<i16>,
+        live: Vec<i16>,
+        endpoint_prior: Option<EndpointPrior>,
+    ) {
         if self.timer_ringing {
             return self.stop_timer_ring();
         }
@@ -161,13 +178,17 @@ impl Controller {
         } else if self.phase == Phase::Speaking || self.announcing {
             self.interrupt_speech(); // barge-in: cut the answer short
         }
-        self.start_pipeline(phrase, true, preroll);
+        self.start_pipeline(phrase, true, preroll, live, endpoint_prior);
     }
 
     pub(super) fn arbitration_done(&mut self, won: bool, best: &Claim, peers: usize) {
         self.arbitrating = false;
         self.arb_claim = None;
-        let audio = std::mem::take(&mut self.arb_audio);
+        let mut audio = std::mem::take(&mut self.arb_audio);
+        let split = self.arb_boundary.min(audio.len());
+        let live = audio.split_off(split);
+        self.arb_boundary = 0;
+        let prior = self.arb_endpoint.take();
         if !won {
             // A dialog that was already listening keeps streaming: this wake word replaced
             // nothing unless this station answers it.
@@ -190,7 +211,7 @@ impl Controller {
         // Capture keeps streaming into the new dialog: switching it off here could drop the
         // chunk between the preroll and live audio.
         let phrase = self.arb_phrase.clone();
-        self.answer_wake(&phrase, audio);
+        self.answer_wake(&phrase, audio, live, prior);
         if self.phase != Phase::Listening {
             self.mic.set_streaming(false); // no dialog started (e.g. HA gone)
         }
@@ -204,6 +225,8 @@ impl Controller {
         self.arbitrating = false;
         self.arb_claim = None;
         self.arb_audio.clear();
+        self.arb_boundary = 0;
+        self.arb_endpoint = None;
         if self.phase != Phase::Listening {
             self.mic.set_streaming(false);
         }
@@ -211,8 +234,24 @@ impl Controller {
 
     // ---------------- pipeline ----------------
 
-    /// The only way into LISTENING (the watchdog bounds it).
-    pub(super) fn start_pipeline(&mut self, phrase: &str, earcon: bool, preroll: Vec<i16>) {
+    /// Uncalibrated energy heuristic: opt-in only, off unless explicitly enabled.
+    fn local_endpointing_enabled() -> bool {
+        matches!(
+            std::env::var("PULSAR_LOCAL_ENDPOINTING").as_deref(),
+            Ok("1")
+        )
+    }
+
+    /// The only way into LISTENING (the watchdog bounds it). `preroll` came with the wake event;
+    /// `live` is post-wake audio held during wake arbitration (empty otherwise).
+    pub(super) fn start_pipeline(
+        &mut self,
+        phrase: &str,
+        earcon: bool,
+        preroll: Vec<i16>,
+        live: Vec<i16>,
+        endpoint_prior: Option<EndpointPrior>,
+    ) {
         // The button, a continued conversation or HA's start_conversation win.
         self.cancel_arbitration();
         if !self.api.voice_subscribed() {
@@ -227,6 +266,19 @@ impl Controller {
         self.dialog += 1;
         self.run.start();
         self.stop_sent = false;
+        self.endpoint = if Self::local_endpointing_enabled() {
+            endpoint_prior.and_then(|p| EndpointRun::new(p, &preroll, &live))
+        } else {
+            None
+        };
+        if let Some(r) = self.endpoint.as_ref() {
+            let p = r.prior();
+            let (on, off) = r.thresholds();
+            debug!(
+                "local endpointing: noise {:.1} dB, wake {:.1} dB, onset {:.1} dB, release {:.1} dB",
+                p.noise_db, p.speech_db, on, off
+            );
+        }
         self.listen_started_ms = now_ms();
         self.tts_url.clear();
         self.tts_played = false;
@@ -246,17 +298,67 @@ impl Controller {
         for chunk in preroll.chunks(512) {
             self.api.voice_send_audio(chunk.to_vec());
         }
+        for chunk in live.chunks(512) {
+            self.api.voice_send_audio(chunk.to_vec());
+        }
         self.mic.set_streaming(true);
         self.arm_watchdog();
         self.update_ui();
     }
 
     fn stop_streaming(&mut self) {
+        // HA finished the phrase first (STT_VAD_END/STT_END), the dialog was cancelled or a
+        // repeated wake replaced it: drop the run so no stale end can follow.
+        if let Some(r) = self.endpoint.as_mut() {
+            r.cancel();
+        }
+        self.endpoint = None;
         // A wake word heard meanwhile keeps its audio.
         self.mic.set_streaming(self.arbitrating);
         if self.phase == Phase::Listening {
             self.phase = Phase::Processing;
         }
+    }
+
+    /// One live 32 ms chunk while the dialog listens. Sends it to HA and feeds the optional
+    /// local detector; a detected end is deferred while the wake earcon is playing.
+    pub(super) fn on_listening_audio(&mut self, pcm: Vec<i16>) {
+        if let Some(r) = self.endpoint.as_mut() {
+            r.push(pcm_level_db(&pcm), true);
+        }
+        self.api.voice_send_audio(pcm);
+        let earcon = matches!(
+            self.player.state(Channel::Announce),
+            PlayState::Playing | PlayState::Loading
+        );
+        if !earcon
+            && self.phase == Phase::Listening
+            && self.endpoint.as_mut().is_some_and(|r| r.take_end())
+        {
+            self.send_endpoint_end();
+        }
+    }
+
+    /// Graceful `VoiceAssistantAudio.end`: finish the phrase on what HA already has, without
+    /// aborting the run. Exactly once per dialog; a stale or replaced dialog sends nothing.
+    fn send_endpoint_end(&mut self) {
+        if self.stop_sent || self.phase != Phase::Listening {
+            return;
+        }
+        if let Some(r) = self.endpoint.as_ref() {
+            let p = r.prior();
+            let (on, off) = r.thresholds();
+            info!(
+                "voice pipeline: local end (experimental), noise {:.1} dB, wake {:.1} dB, \
+                 onset {:.1} dB, release {:.1} dB",
+                p.noise_db, p.speech_db, on, off
+            );
+        }
+        self.api.voice_send_audio_end();
+        // Stop feeding the microphone, but keep the run: HA finishes STT and the answer.
+        self.stop_streaming();
+        self.arm_watchdog();
+        self.update_ui();
     }
 
     pub(super) fn on_voice_event(&mut self, ev: VaEvent, data: &HashMap<String, String>) {
@@ -360,7 +462,7 @@ impl Controller {
         self.send_tts_report(ok);
         if ok && self.continue_conversation && !self.timer_ringing && !self.mic_muted() {
             self.continue_conversation = false;
-            self.start_pipeline("", false, Vec::new());
+            self.start_pipeline("", false, Vec::new(), Vec::new(), None);
             return;
         }
         self.finish_interaction();
@@ -392,6 +494,7 @@ impl Controller {
         }
         self.run.awaiting_run_start = false;
         self.send_tts_report(false);
+        self.endpoint = None;
         self.mic.set_streaming(self.arbitrating);
         self.phase = Phase::Idle;
         self.dialog += 1;
@@ -483,7 +586,7 @@ impl Controller {
             self.interrupt_speech();
             return self.finish_interaction();
         }
-        self.start_pipeline("", true, Vec::new());
+        self.start_pipeline("", true, Vec::new(), Vec::new(), None);
     }
 
     // ---------------- announcements ----------------
