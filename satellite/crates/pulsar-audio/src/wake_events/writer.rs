@@ -19,6 +19,9 @@ use super::{Command, Counters, Job, Recording};
 
 /// The writer wakes up this often to look for commands and the 60 s stats period.
 const WAKE_MS: u64 = 200;
+/// Outcomes may arrive before the window they belong to (a lost arbitration ~250 ms after the
+/// hit, the audio 1 s later): they wait here for its sidecar.
+const MAX_PENDING_OUTCOMES: usize = 32;
 
 pub(super) fn spawn(
     dir: PathBuf,
@@ -41,6 +44,7 @@ pub(super) fn spawn(
         index: Vec::new(),
         last_stats_ms: pulsar_core::now_ms(),
         last_written: None,
+        pending_outcomes: Vec::new(),
     };
     match std::thread::Builder::new()
         .name("wake-events".into())
@@ -67,6 +71,8 @@ struct Writer {
     index: Vec<logic::Meta>,
     last_stats_ms: i64,
     last_written: Option<Stats>,
+    /// Outcomes whose sidecar did not exist yet.
+    pending_outcomes: Vec<(String, Outcome, Option<String>)>,
 }
 
 fn json_path(dir: &Path, id: &str, ext: &str) -> PathBuf {
@@ -223,13 +229,17 @@ impl Writer {
             rec.score_peak
         );
         self.index.push(logic::Meta {
-            id: rec.id,
+            id: rec.id.clone(),
             kind: rec.kind.as_str().to_owned(),
             utc_ms: rec.utc_ms,
             labeled: side.label.is_some(),
             bytes: (wav.len() + json.len()) as u64,
         });
         self.enforce_retention();
+        if let Some(i) = self.pending_outcomes.iter().position(|p| p.0 == rec.id) {
+            let (_, outcome, stt_text) = self.pending_outcomes.remove(i);
+            self.apply_outcome(&rec.id, outcome, stt_text.as_deref());
+        }
     }
 
     fn enforce_retention(&mut self) {
@@ -251,22 +261,16 @@ impl Writer {
                 outcome,
                 stt_text,
             } => {
-                let Some(mut side) = self.read_sidecar(&id) else {
-                    debug!("wake events: no sidecar for {id}");
+                if self.read_sidecar(&id).is_none() {
+                    // The hit's window finishes 1 s after the confirming chunk; an outcome of a
+                    // dialog that never started (arbiter_lost, a quick cancel) comes earlier.
+                    if self.pending_outcomes.len() >= MAX_PENDING_OUTCOMES {
+                        self.pending_outcomes.remove(0);
+                    }
+                    self.pending_outcomes.push((id, outcome, stt_text));
                     return;
-                };
-                side.outcome = Some(outcome.as_str().to_owned());
-                if let Some(t) = stt_text {
-                    side.stt_text = Some(t);
                 }
-                if let Err(e) = write_atomic(
-                    &json_path(&self.dir, &id, "json"),
-                    logic::sidecar_json(&side).as_bytes(),
-                ) {
-                    warn!("wake events: cannot update {id}: {e}");
-                } else {
-                    debug!("wake events: {id} outcome {}", outcome.as_str());
-                }
+                self.apply_outcome(&id, outcome, stt_text.as_deref());
             }
             Command::FalseAlarm => {
                 let now = logic::utc_ms();
@@ -293,6 +297,25 @@ impl Writer {
                 self.index[i].labeled = true;
                 info!("wake events: {id} labeled false by the user");
             }
+        }
+    }
+
+    fn apply_outcome(&mut self, id: &str, outcome: Outcome, stt_text: Option<&str>) {
+        let Some(mut side) = self.read_sidecar(id) else {
+            debug!("wake events: no sidecar for {id}");
+            return;
+        };
+        side.outcome = Some(outcome.as_str().to_owned());
+        if let Some(t) = stt_text {
+            side.stt_text = Some(t.to_owned());
+        }
+        if let Err(e) = write_atomic(
+            &json_path(&self.dir, id, "json"),
+            logic::sidecar_json(&side).as_bytes(),
+        ) {
+            warn!("wake events: cannot update {id}: {e}");
+        } else {
+            debug!("wake events: {id} outcome {}", outcome.as_str());
         }
     }
 
@@ -372,6 +395,7 @@ mod tests {
                 index: Vec::new(),
                 last_stats_ms: 0,
                 last_written: None,
+                pending_outcomes: Vec::new(),
             },
             counters,
         )
@@ -429,6 +453,39 @@ mod tests {
         let stats =
             logic::parse_stats(&fs::read_to_string(dir.join("stats.json")).unwrap()).unwrap();
         assert!((stats.listening_seconds - 1.5).abs() < 1e-9);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_outcome_before_its_window_waits_for_the_sidecar() {
+        let dir = temp_dir("pending");
+        fs::create_dir_all(&dir).unwrap();
+        let (mut w, _) = writer(&dir);
+        let now = logic::utc_ms();
+        let rec = Recording {
+            id: logic::event_id(now, Kind::Hit, 1),
+            kind: Kind::Hit,
+            utc_ms: now,
+            pre_ms: 3000,
+            post_ms: 1000,
+            score_peak: 0.95,
+            dry_run: false,
+            samples: vec![0; 160],
+            label: None,
+            label_source: None,
+        };
+        let id = rec.id.clone();
+        // A lost arbitration arrives before the 1 s post-roll finishes the window.
+        w.on_command(Command::Outcome {
+            id: id.clone(),
+            outcome: Outcome::ArbiterLost,
+            stt_text: None,
+        });
+        assert_eq!(w.pending_outcomes.len(), 1);
+        w.save(rec);
+        assert!(w.pending_outcomes.is_empty());
+        let side = w.read_sidecar(&id).unwrap();
+        assert_eq!(side.outcome.as_deref(), Some("arbiter_lost"));
         let _ = fs::remove_dir_all(&dir);
     }
 
