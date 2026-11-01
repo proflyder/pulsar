@@ -221,6 +221,7 @@ async fn run(m: &'static Model, a: Args) -> std::io::Result<bool> {
         custom.then(|| PathBuf::from(RICARDO_MODEL)),
         custom,
         Some(PathBuf::from(COMMAND_MODEL)),
+        None,
     );
     let frame = h.frame();
     h.set_commands(a.commands);
@@ -248,7 +249,7 @@ async fn run(m: &'static Model, a: Args) -> std::io::Result<bool> {
         tokio::select! {
             () = &mut end => break,
             ev = rx.recv() => match ev {
-                Some(FrontendEvent::Wake { phrase, level_db, preroll, endpoint_prior: _ }) => {
+                Some(FrontendEvent::Wake { phrase, level_db, preroll, endpoint_prior: _, event_id: _ }) => {
                     wakes += 1;
                     out!(
                         "t={:6.2}s WAKE '{phrase}' level {level_db:.1} dB preroll {} ms",

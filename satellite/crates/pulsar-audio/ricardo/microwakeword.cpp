@@ -6,8 +6,8 @@
 // features it was trained on. The model and the runtime are never distributed
 // in this repository.
 //
-// Only the audio processing thread calls mww_feed/mww_reset. mww_destroy runs
-// after that thread has stopped.
+// Only the audio processing thread calls mww_feed/mww_reset/mww_configure.
+// mww_destroy runs after that thread has stopped.
 
 #include <dlfcn.h>
 
@@ -30,8 +30,12 @@ struct Quantization {
   int32_t zero;
 };
 
+// The thresholds come from the model manifest (see wake_events::logic): the detector
+// defaults match the trained model when it has none.
 constexpr float kCutoff = 0.9f;
 constexpr size_t kWindow = 10;
+// Upper bound of a configurable sliding window (contract v1 allows 1..50).
+constexpr size_t kMaxWindow = 50;
 constexpr const char *kLibTflite = "/system/vendor/quasar/libs/libtflite.so";
 
 void log_error(const char *what) { std::fprintf(stderr, "mww: %s\n", what); }
@@ -61,7 +65,9 @@ struct Impl {
   FrontendState fe{};
   bool fe_ready = false, ready = false;
   std::array<int8_t, 120> features{};
-  std::array<float, kWindow> probs{};
+  std::array<float, kMaxWindow> probs{};
+  float cutoff = kCutoff;
+  size_t window = kWindow;
   size_t filled = 0, count = 0, pos = 0;
   int warmup = 100;
   Quantization iq{}, oq{};
@@ -139,9 +145,18 @@ struct Impl {
         stderr,
         "mww: loaded %s (int8 [1,3,40], cutoff=%.2f, window=%zu)\n",
         path.c_str(),
-        kCutoff,
-        kWindow);
+        cutoff,
+        window);
     return true;
+  }
+
+  // Sets the manifest thresholds; call before feeding. The history restarts so the
+  // windowed mean never mixes two window sizes.
+  void configure(float c, size_t w) {
+    if (c > 0 && c < 1) cutoff = c;
+    if (w >= 1 && w <= kMaxWindow) window = w;
+    probs.fill(0);
+    count = pos = 0;
   }
 
   bool reset() {
@@ -207,17 +222,19 @@ struct Impl {
             ready = false;
             return false;
           }
-          probs[pos++ % kWindow] = (int(result) - oq.zero) * oq.scale;
-          count = std::min(count + 1, kWindow);
+          probs[pos++ % window] = (int(result) - oq.zero) * oq.scale;
+          count = std::min(count + 1, window);
           if (warmup > 0) {
             warmup -= 3;
             continue;
           }
-          if (count == kWindow) {
+          if (count == window) {
             float mean = 0;
-            for (float p : probs) mean += p / kWindow;
+            for (size_t i = 0; i < window; ++i) mean += probs[i] / window;
+            // Also reported without a hit: near-miss recording needs the running mean
+            // of every chunk (contract v1).
             score = std::max(score, mean);
-            hit = hit || mean >= kCutoff;
+            hit = hit || mean >= cutoff;
           }
         }
       }
@@ -259,6 +276,13 @@ int mww_feed(void *handle, const int16_t *pcm, size_t samples, float *score) {
 int mww_reset(void *handle) {
   if (!handle) return -1;
   return static_cast<Impl *>(handle)->reset() ? 0 : -1;
+}
+
+// Manifest thresholds from the wake-event contract: cutoff in (0,1), window 1..50.
+// Values outside the ranges are ignored (the loaded defaults stay).
+void mww_configure(void *handle, float cutoff, int window) {
+  if (!handle || window <= 0) return;
+  static_cast<Impl *>(handle)->configure(cutoff, static_cast<size_t>(window));
 }
 
 }  // extern "C"
