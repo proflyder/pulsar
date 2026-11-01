@@ -43,6 +43,66 @@ linked through a small C ABI. It uses the firmware's `libtflite.so` and the
 vendored TensorFlow Lite microfrontend; the model is not committed (see
 `satellite/wakewords/README.md`).
 
+## Запись wake-событий
+
+Детектор «Рикардо» пишет реальные срабатывания, near-miss и сообщённые промахи, чтобы считать
+FP на час прослушивания и добавлять hard negatives в обучение (контракт v1, общий с
+инструментами обучения).
+
+- Каталог: `/data/pulsar/wake-events/`. Файлы `<id>.wav` (PCM16 mono 16 кГц, ровно тот
+  `VQE_OMNI_WITH_GAIN`, который слышит детектор, без усиления) и `<id>.json` (сайдкар);
+  `stats.json` — счётчики (переписывается не чаще раза в 60 с и при остановке демона).
+  `id` = `<UTC yyyymmddTHHMMSSZ>-<kind>-<seq>`, `seq` — счётчик запуска.
+- Виды: `hit` — подтверждение детектора (3 с до + 1 с после), `near` — локальный максимум
+  среднего вероятности в полосе 0.5..cutoff (3 с до пика + 1 с после, не чаще раза в 3 с и не
+  раньше 2 с после hit), `miss` — кнопка «Wake: не услышала» (последние 6 с кольца).
+- Сайдкар: `schema`, `id`, `kind`, `utc`, `sample_rate`, `pre_ms`, `post_ms`, `score_peak`,
+  `cutoff`, `window`, `model_sha256`, `pulsar_version`, `dry_run`, `outcome`, `stt_text`,
+  `label`, `label_source`, `labeled_utc`. `outcome` заполняется, когда диалог, начатый hit,
+  заканчивается: `answered`, `empty_stt`, `cancelled`, `error`, `arbiter_lost`; `dry_run` —
+  сразу при записи. `stt_text` — текст STT_END этого диалога. Метки ставит только pulsar:
+  `miss` → `label=missed`, `label_source=user`; кнопка «Wake: ложное срабатывание» помечает
+  `label=false` у самого нового `hit` за последние 10 минут (если такого нет — предупреждение
+  в логе, файлы не меняются).
+- Порог и окно берутся из манифеста модели `<stem>.json` рядом с `.tflite`
+  (`micro.probability_cutoff` в (0,1), `micro.sliding_window_size` 1..50), иначе 0.9 / 10;
+  источник пишется в лог при старте (`wake events: … cutoff … window …`).
+- Ретеншн: не больше 300 МБ или 3000 событий. Сначала удаляются самые старые непомеченные
+  `near`, затем непомеченные `hit`, затем самые старые вообще; помеченные — последними.
+- `stats.json`: `since_utc`, `listening_seconds` (время, реально поданное детектору, без
+  мьюта), `hits`, `near`, `miss`, `dry_run_listening_seconds`, `dropped`,
+  `model_sha256`. Счётчики продолжаются между перезапусками.
+
+Сущности Home Assistant (ESPHome):
+
+- кнопка `wake_false_alarm` «Wake: ложное срабатывание»;
+- кнопка `wake_missed` «Wake: не услышала»;
+- переключатель `wake_event_recording` «Wake: запись событий» (по умолчанию включён,
+  `state.conf` `wake_event_recording=`);
+- переключатель `wake_dry_run` «Wake: тестовый режим (без ответа)» (по умолчанию выключен,
+  `wake_dry_run=`): подтверждённый hit записывается с `outcome=dry_run`, но не начинает
+  диалог, не участвует в арбитраже и не приглушает музыку. При выключенной записи hit всё
+  равно не отвечает, но ничего не сохраняется.
+
+Запись работает только для кастомного детектора «Рикардо» (`wake_word=ricardo`); нативный
+спотер не пишет. При мьюте микрофона кольцо не ведётся и время прослушивания не считается.
+Поток обработки только копирует аудио в ограниченный канал: при отставании диска окно
+теряется и увеличивает `dropped`, микрофон не блокируется.
+
+Как забрать файлы:
+
+```bash
+adb -s <serial> pull /data/pulsar/wake-events/ ./wake-events/
+# или по ssh:
+scp -r root@<ip>:/data/pulsar/wake-events/ ./wake-events/
+```
+
+Проверки: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -D warnings` и
+`cargo test --workspace` (Linux arm64, `rust:1.99.1-bookworm`); падают только 7 известных
+host-тестов `pulsar-update` про имя x86_64-ассета (см. «Verification performed»). На станции
+не проверено: реальная запись с микрофона, загрузка манифеста рядом с моделью, поведение кнопок
+в HA и заполнение `outcome` живым пайплайном.
+
 ## Build
 
 Linux or WSL2, Zig 0.14.1, `cargo-zigbuild` 0.24.0:
@@ -60,6 +120,8 @@ Put the model here before an install:
 
 ```bash
 cp /path/to/ru_ricardo_mww.tflite satellite/wakewords/
+# необязательно: манифест с micro.probability_cutoff / micro.sliding_window_size
+cp /path/to/ru_ricardo_mww.json satellite/wakewords/
 ```
 
 `pulsar-install` copies it to `/data/pulsar/wakewords/` with a SHA-256 check.
