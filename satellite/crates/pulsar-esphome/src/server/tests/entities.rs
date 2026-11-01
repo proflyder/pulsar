@@ -88,6 +88,28 @@ fn state_key(m: &[u8]) -> Option<u32> {
         .map(|f| f.u32())
 }
 
+/// The fork's own entity keys: `key` of a ListEntities message (field 2).
+fn entity_key(m: &[u8]) -> Option<u32> {
+    field(m, 2)
+        .filter(|f| f.wt == WireType::Fixed32)
+        .map(|f| f.u32())
+}
+
+/// Entities and states this fork adds to the C++ reference (wake-event recording).
+fn fork_only(t: u32, m: &[u8]) -> bool {
+    const KEYS: [u32; 4] = [
+        key::SW_WAKE_EVENT_RECORDING,
+        key::SW_WAKE_DRY_RUN,
+        key::BUTTON_WAKE_FALSE_ALARM,
+        key::BUTTON_WAKE_MISSED,
+    ];
+    match t {
+        msg::LIST_SWITCH | msg::LIST_BUTTON => entity_key(m).is_some_and(|k| KEYS.contains(&k)),
+        msg::SWITCH_STATE => state_key(m).is_some_and(|k| KEYS.contains(&k)),
+        _ => false,
+    }
+}
+
 #[tokio::test]
 async fn selftest_matches_cxx_golden_bytes() {
     let golden: Vec<(u32, Vec<u8>)> = RAW
@@ -137,10 +159,10 @@ async fn selftest_matches_cxx_golden_bytes() {
                 }
             }
             p.send(msg::SUBSCRIBE_STATES_REQ, &Writer::new()).await;
-            while got.len() < golden.len() {
-                got.push(p.recv().await.unwrap());
-            }
-            assert!(p.sync().await.is_empty());
+            got.extend(p.sync().await);
+            // This fork adds the wake-event switch and button entities; they are not part of the
+            // C++ reference capture, so they are compared only for being extra.
+            got.retain(|(t, m)| !fork_only(*t, m));
             assert_eq!(got.len(), golden.len());
             for (i, (g, r)) in golden.iter().zip(&got).enumerate() {
                 assert_eq!(g.0, r.0, "message {i}");
@@ -708,9 +730,10 @@ async fn mini_has_no_clock_lux_mute_case_or_button_entities() {
                 }
                 keys.push(field(&m, 2).unwrap().u32());
             }
-            // 14 entities plus the led_show service; no clock, Lux, wake pre-roll, hardware MUTE,
-            // case colour or Button entities.
-            assert_eq!(keys.len(), 15, "keys: {keys:?}");
+            // 18 entities plus the led_show service; no clock, Lux, wake pre-roll, hardware
+            // MUTE, case colour or Button entities. The two wake-event switches and two buttons
+            // are always listed, even without the Ricardo detector.
+            assert_eq!(keys.len(), 19, "keys: {keys:?}");
             assert!(keys.contains(&key::ACTION_LED_SHOW));
             let absent = [
                 key::SW_CLOCK,

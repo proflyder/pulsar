@@ -268,6 +268,8 @@ pub enum SwitchId {
     VoiceIndication = 5,
     WakePreroll = 6,
     ClockAutoBrightness = 7,
+    WakeEventRecording = 8,
+    WakeDryRun = 9,
 }
 
 #[repr(u32)]
@@ -312,6 +314,10 @@ pub enum SelectId {
 pub enum ButtonId {
     ZigbeeJoin = 1,
     ZigbeeLeave = 2,
+    /// «Wake: ложное срабатывание».
+    WakeFalseAlarm = 3,
+    /// «Wake: не услышала».
+    WakeMissed = 4,
 }
 
 #[repr(u32)]
