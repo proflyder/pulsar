@@ -11,6 +11,7 @@ libloading = { workspace = true }
 log = { workspace = true }
 pulsar-alsa = { path = "../pulsar-alsa" }
 pulsar-core = { path = "../pulsar-core" }
+ring = { workspace = true }
 tokio = { workspace = true }
 
 [build-dependencies]

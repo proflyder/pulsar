@@ -12,7 +12,9 @@ mod frontend;
 #[allow(unsafe_code)]
 mod ricardo;
 mod spectrum;
+pub mod wake_events;
 
 pub use frontend::{FrontendEvent, FrontendHandle, FrontendStats, spawn};
 pub use ricardo::RicardoWake;
 pub use spectrum::SpectrumAnalyzer;
+pub use wake_events::{Outcome, WakeEventOptions, WakeEventsHandle};

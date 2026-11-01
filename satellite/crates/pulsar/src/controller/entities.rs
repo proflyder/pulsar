@@ -72,6 +72,8 @@ impl Controller {
         api.publish_switch(SwitchId::NearestAnswers, self.st.nearest_answers);
         api.publish_switch(SwitchId::VoiceIndication, self.st.voice_indication);
         api.publish_switch(SwitchId::WakePreroll, self.st.wake_preroll);
+        api.publish_switch(SwitchId::WakeEventRecording, self.st.wake_recording);
+        api.publish_switch(SwitchId::WakeDryRun, self.st.wake_dry_run);
         self.publish_update();
         let api = &self.api;
         api.publish_binary_sensor(BinarySensorId::HwMicMute, self.hw_mic_muted);
@@ -141,6 +143,7 @@ impl Controller {
                 if !state {
                     self.cancel_arbitration();
                     if self.phase == logic::Phase::Listening {
+                        self.mark_wake_cancelled();
                         self.finish_interaction();
                     }
                 }
@@ -172,6 +175,33 @@ impl Controller {
             SwitchId::WakePreroll => {
                 self.st.wake_preroll = state;
                 self.mic.set_preroll(state);
+            }
+            SwitchId::WakeEventRecording => {
+                self.st.wake_recording = state;
+                self.mic.set_wake_recording(state);
+                info!(
+                    "wake events: recording {}",
+                    if state { "on" } else { "off" }
+                );
+                // Privacy: the choice must survive a power cut right after it.
+                let _ = self.persist_now();
+                self.api.publish_switch(id, state);
+                return;
+            }
+            SwitchId::WakeDryRun => {
+                self.st.wake_dry_run = state;
+                self.mic.set_wake_dry_run(state);
+                info!(
+                    "wake events: dry run {}",
+                    if state {
+                        "on, hits are recorded but not answered"
+                    } else {
+                        "off"
+                    }
+                );
+                let _ = self.persist_now();
+                self.api.publish_switch(id, state);
+                return;
             }
         }
         self.api.publish_switch(id, state);
@@ -290,6 +320,17 @@ impl Controller {
     }
 
     fn on_button(&mut self, id: ButtonId) {
+        match id {
+            ButtonId::WakeFalseAlarm => {
+                info!("wake events: «ложное срабатывание» pressed");
+                return self.mic.wake_event_false_alarm();
+            }
+            ButtonId::WakeMissed => {
+                info!("wake events: «не услышала» pressed");
+                return self.mic.wake_missed();
+            }
+            ButtonId::ZigbeeJoin | ButtonId::ZigbeeLeave => {}
+        }
         let Some(z) = &self.zigbee else {
             return;
         };
@@ -300,6 +341,7 @@ impl Controller {
         match id {
             ButtonId::ZigbeeJoin => z.join(),
             ButtonId::ZigbeeLeave => z.leave(),
+            ButtonId::WakeFalseAlarm | ButtonId::WakeMissed => unreachable!("handled above"),
         }
     }
 
@@ -387,6 +429,7 @@ impl Controller {
                 }
                 self.publish_microphones();
                 if m && self.phase == logic::Phase::Listening {
+                    self.mark_wake_cancelled();
                     self.finish_interaction();
                 }
                 self.update_detection();
@@ -402,6 +445,7 @@ impl Controller {
                 if muted {
                     self.cancel_arbitration();
                     if self.phase == logic::Phase::Listening {
+                        self.mark_wake_cancelled();
                         self.finish_interaction();
                     }
                 }

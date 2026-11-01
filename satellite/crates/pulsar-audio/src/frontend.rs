@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{
     AtomicBool, AtomicU32, AtomicU64, Ordering::AcqRel, Ordering::Acquire, Ordering::Relaxed,
 };
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -27,6 +28,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::endpoint::{EndpointPrior, percentile_db};
 use crate::engine::{Engine, Stage, VQE_OMNI, VQE_OMNI_WITH_GAIN, to_s16};
 use crate::spectrum::SpectrumAnalyzer;
+use crate::wake_events::{
+    self, Capture, Counters, Job, Outcome, Recording, WakeEventOptions, WakeEventsRuntime,
+    WakeInput, logic,
+};
 
 /// Wake word level window: 1.5 s in 32 ms blocks at 16 kHz, independent of VQE chunk size.
 /// Long enough to cover the phrase when the spotter confirms; the loudest blocks are the phrase.
@@ -66,6 +71,10 @@ pub enum FrontendEvent {
         /// Levels of the wake window on the same channel as `Audio`, for the experimental
         /// local endpoint detector. None until a full window was seen.
         endpoint_prior: Option<EndpointPrior>,
+        /// Id of the recorded wake event (`<utc>-hit-<n>`) when the Ricardo detector's hit was
+        /// recorded; the controller writes its dialog outcome to that sidecar. None for the native
+        /// spotters, with recording off and on a regular end of the front-end.
+        event_id: Option<String>,
     },
     Command {
         word: String,
@@ -109,13 +118,34 @@ pub fn spawn(
     custom_wake_model: Option<PathBuf>,
     custom_active: bool,
     command_model_dir: Option<PathBuf>,
+    wake: Option<WakeEventOptions>,
 ) -> (FrontendHandle, UnboundedReceiver<FrontendEvent>) {
     let (tx, rx) = unbounded_channel();
+    // The manifest next to the loaded model sets the detector's cutoff / window; near-miss
+    // recording and the sidecars use the same numbers.
+    let (thresholds, from_manifest) = custom_wake_model
+        .as_deref()
+        .map_or((logic::Thresholds::default(), false), logic::thresholds_for);
+    if let Some(path) = &custom_wake_model {
+        info!(
+            "Ricardo thresholds: cutoff {:.2}, window {} ({})",
+            thresholds.cutoff,
+            thresholds.window,
+            if from_manifest {
+                format!("{}", path.with_extension("json").display())
+            } else {
+                "defaults, no valid manifest".to_owned()
+            }
+        );
+    }
     let mut inner = Inner {
         shared: Arc::new(Shared::new(custom_active)),
         pipe: None,
         threads: Vec::new(),
         frame: 0,
+        wake: wake
+            .as_ref()
+            .and_then(|w| wake_events::start(w, thresholds, from_manifest)),
         _events: tx.clone(),
     };
     let command_dir = command_model_dir.filter(|d| !d.as_os_str().is_empty());
@@ -124,6 +154,7 @@ pub fn spawn(
         &wake_model_dir,
         custom_wake_model.as_deref(),
         command_dir.as_deref(),
+        thresholds,
     ) {
         Some(eng) => {
             inner.frame = eng.frame();
@@ -211,6 +242,49 @@ impl FrontendHandle {
         self.inner.frame
     }
 
+    /// Wake-event recording (switch «Wake: запись событий»), on by default. Off: no window is
+    /// kept and a pending one is dropped; the detector still hears the microphone.
+    pub fn set_wake_recording(&self, on: bool) {
+        self.inner.shared.recording.store(on, Relaxed);
+    }
+
+    /// Dry run (switch «Wake: тестовый режим (без ответа)»): a Ricardo hit is recorded with the
+    /// outcome `dry_run` and does not answer, arbitrate or duck the music.
+    pub fn set_wake_dry_run(&self, on: bool) {
+        self.inner.shared.dry_run.store(on, Relaxed);
+    }
+
+    /// «Wake: не услышала»: records the last 6 s of the ring. Ignored while the detector is off
+    /// (muted), without the Ricardo model, or with recording off.
+    pub fn wake_missed(&self) {
+        self.inner.shared.wake_miss.store(true, Relaxed);
+    }
+
+    /// The dialog started by a recorded hit ended: fills `outcome` (and `stt_text` when STT
+    /// reported one) of that event's sidecar.
+    pub fn wake_event_outcome(&self, id: &str, outcome: Outcome, stt_text: Option<&str>) {
+        match &self.inner.wake {
+            Some(w) => {
+                if !w.handle.set_outcome(id, outcome, stt_text) {
+                    warn!("wake events: writer is gone, outcome of {id} not saved");
+                }
+            }
+            None => warn!("wake events: recording is not running, outcome of {id} not saved"),
+        }
+    }
+
+    /// «Wake: ложное срабатывание»: labels the newest hit of the last 10 minutes.
+    pub fn wake_event_false_alarm(&self) {
+        match &self.inner.wake {
+            Some(w) => {
+                if !w.handle.false_alarm() {
+                    warn!("wake events: writer is gone, false-alarm label not saved");
+                }
+            }
+            None => warn!("wake events: recording is not running, false-alarm label not saved"),
+        }
+    }
+
     /// Every block read from ALSA, interleaved as captured (`capture_channels` per frame), goes
     /// to `tap` while one is set (frontend_probe --record).
     pub fn set_raw_tap(&self, tap: Option<UnboundedSender<Vec<i16>>>) {
@@ -241,6 +315,12 @@ struct Shared {
     wake_pending: AtomicU32,
     preroll: AtomicBool,
     music: AtomicBool,
+    /// Wake-event recording on (no ring, no writes when off).
+    recording: AtomicBool,
+    /// Dry run: a hit is recorded, nothing answers.
+    dry_run: AtomicBool,
+    /// «Wake: не услышала» pressed; the processing thread takes the ring.
+    wake_miss: AtomicBool,
     pending_model: Mutex<Option<PathBuf>>,
     tap_on: AtomicBool,
     tap: Mutex<Option<UnboundedSender<Vec<i16>>>>,
@@ -263,6 +343,9 @@ impl Shared {
             wake_pending: AtomicU32::new(0),
             preroll: AtomicBool::new(true),
             music: AtomicBool::new(false),
+            recording: AtomicBool::new(true),
+            dry_run: AtomicBool::new(false),
+            wake_miss: AtomicBool::new(false),
             pending_model: Mutex::new(None),
             tap_on: AtomicBool::new(false),
             tap: Mutex::new(None),
@@ -299,6 +382,8 @@ struct Inner {
     threads: Vec<JoinHandle<()>>,
     /// Samples per VQE output chunk; 0 without a running engine.
     frame: usize,
+    /// Writer thread of the wake-event recording; None without the feature or its directory.
+    wake: Option<WakeEventsRuntime>,
     // Keeps the event channel open: without a front-end, recv() waits forever instead of
     // returning None.
     _events: UnboundedSender<FrontendEvent>,
@@ -327,11 +412,12 @@ impl Inner {
                 .spawn(move || capture(model, period, &shared, &p))?,
         );
         let shared = self.shared.clone();
+        let wake = self.wake.as_ref().and_then(WakeEventsRuntime::input);
         self.threads.push(
             std::thread::Builder::new()
                 .name("audio-process".into())
                 .stack_size(PROCESSING_STACK)
-                .spawn(move || processing(model, eng, &shared, &pipe, &tx))?,
+                .spawn(move || processing(model, eng, &shared, &pipe, &tx, wake))?,
         );
         Ok(())
     }
@@ -348,6 +434,11 @@ impl Inner {
         }
         for t in self.threads.drain(..) {
             let _ = t.join();
+        }
+        // After the processing thread: its job sender is gone, so the writer exits and writes
+        // the final `stats.json`.
+        if let Some(w) = &mut self.wake {
+            w.shutdown();
         }
     }
 }
@@ -808,12 +899,30 @@ impl std::fmt::Display for Chunks {
     }
 }
 
+/// Capture state of the wake-event recording, all on the processing thread.
+struct WakeState {
+    capture: Capture,
+    jobs: SyncSender<Job>,
+    counters: Arc<Counters>,
+}
+
+impl WakeState {
+    /// Hands a finished window to the writer; a full queue drops it and counts the drop.
+    fn send(&self, rec: Recording) {
+        if self.jobs.try_send(Job::Save(Box::new(rec))).is_err() {
+            self.counters.dropped.fetch_add(1, Relaxed);
+            warn!("wake events: writer is behind, window dropped");
+        }
+    }
+}
+
 fn processing(
     model: &'static Model,
     mut eng: Engine,
     shared: &Shared,
     pipe: &Pipe,
     tx: &UnboundedSender<FrontendEvent>,
+    wake_input: Option<WakeInput>,
 ) {
     let period = eng.chunk;
     let nch = model.capture_channels as usize;
@@ -836,6 +945,12 @@ fn processing(
     let mut custom_failed = false;
     let frame = eng.frame();
     let mut ring = PrerollRing::new(PREROLL_SAMPLES / frame.max(1), frame);
+    let mut wake = wake_input.map(|w| WakeState {
+        capture: Capture::new(frame, w.thresholds.cutoff),
+        jobs: w.jobs,
+        counters: w.counters,
+    });
+    let chunk_ms = frame as u64 * 1000 / u64::from(logic::SAMPLE_RATE);
     // Chunks since the wake spotter's 1st-stage hit, while its verifier waits.
     let mut first_stage_age: Option<usize> = None;
 
@@ -895,7 +1010,11 @@ fn processing(
         // first: its Acquire pairs with `wake_handled`, after the owner's `set_streaming(true)`.
         let custom_active = shared.custom.load(Relaxed);
         let detecting = shared.detect.load(Relaxed);
-        let mut custom_score = None;
+        let dry_run = shared.dry_run.load(Relaxed);
+        let mut custom_hit = None;
+        let mut custom_mean = None;
+        let mut custom_feeding = false;
+        let mut wake_hit_id = None;
         match eng.output(VQE_OMNI_WITH_GAIN).filter(|d| !d.is_empty()) {
             Some(d) => {
                 gain_hist[gain_pos] = mean_square(d);
@@ -905,9 +1024,17 @@ fn processing(
                     // The Ricardo detector hears the same cleaned chunk as the ring and the
                     // stock spotter; its confirmation then takes the pre-roll from the ring.
                     if custom_active && detecting && !custom_failed {
+                        custom_feeding = true;
                         match eng.feed_custom(slot) {
-                            Some(Ok((true, score))) => custom_score = Some(score),
-                            Some(Ok(_)) => {}
+                            Some(Ok((true, score))) => {
+                                custom_hit = Some(score);
+                                custom_mean = Some(score);
+                            }
+                            Some(Ok((false, score))) => {
+                                // The windowed mean of every chunk drives the near-miss band;
+                                // negative means the detector window is still filling.
+                                custom_mean = (score >= 0.0).then_some(score);
+                            }
                             Some(Err(e)) => {
                                 custom_failed = true;
                                 error!("Ricardo wake word: {e}");
@@ -916,6 +1043,45 @@ fn processing(
                                 custom_failed = true;
                                 error!("Ricardo wake word: detector is not loaded");
                             }
+                        }
+                    }
+                    // The same detector input, in a 7 s ring: a hit keeps 3 s before and 1 s
+                    // after, a miss the last 6 s. Off when muted or without the Ricardo model.
+                    let recording = wake.is_some()
+                        && shared.recording.load(Relaxed)
+                        && custom_active
+                        && detecting
+                        && !custom_failed;
+                    if recording {
+                        let now = pulsar_core::now_ms();
+                        let utc = logic::utc_ms();
+                        let miss = shared.wake_miss.swap(false, Relaxed);
+                        let st = wake.as_mut().expect("wake is Some when recording");
+                        if miss && let Some(rec) = st.capture.miss(utc) {
+                            st.counters.miss.fetch_add(1, Relaxed);
+                            st.send(rec);
+                        }
+                        let p = st
+                            .capture
+                            .push(slot, custom_mean, custom_hit, dry_run, now, utc);
+                        if p.hit.is_some() {
+                            st.counters.hits.fetch_add(1, Relaxed);
+                        }
+                        if p.near {
+                            st.counters.near.fetch_add(1, Relaxed);
+                        }
+                        if p.dropped {
+                            st.counters.dropped.fetch_add(1, Relaxed);
+                        }
+                        for rec in p.finished {
+                            st.send(rec);
+                        }
+                        wake_hit_id = p.hit.map(|h| h.id);
+                    } else {
+                        // No ring without recording: a miss button pressed meanwhile is void.
+                        shared.wake_miss.store(false, Relaxed);
+                        if let Some(st) = wake.as_mut() {
+                            st.capture.reset();
                         }
                     }
                     if shared.wake_pending.load(Acquire) > 0 || shared.stream.load(Relaxed) {
@@ -932,26 +1098,43 @@ fn processing(
             }
         }
 
-        if let Some(score) = custom_score {
-            let level_db = wake_level_db(&level_hist.values);
-            let speech_end = level_hist.speech_end(frame);
-            let endpoint_prior = endpoint_prior(&gain_hist, gain_filled);
-            let rule = wake_preroll_rule(model, shared, "ricardo");
-            let n = preroll_chunks(rule, None).min(ring.chunks());
-            let preroll = ring.last(n);
-            info!(
-                "Ricardo wake word detected (probability {score:.3}); \
-                 wake timing: speech_end={} preroll={}",
-                Chunks(speech_end),
-                preroll.len() / frame
-            );
-            shared.wake_pending.fetch_add(1, Relaxed);
-            let _ = tx.send(FrontendEvent::Wake {
-                phrase: "Рикардо".into(),
-                level_db,
-                preroll,
-                endpoint_prior,
-            });
+        // Listening time is the audio the detector actually heard (contract v1).
+        if custom_feeding && let Some(st) = wake.as_ref() {
+            st.counters.listening_ms.fetch_add(chunk_ms, Relaxed);
+            if dry_run {
+                st.counters.dry_run_ms.fetch_add(chunk_ms, Relaxed);
+            }
+        }
+
+        if let Some(score) = custom_hit {
+            if dry_run {
+                // Recorded with the outcome `dry_run` by the writer; no earcon, no claim, no
+                // dialog, and the music keeps playing.
+                info!(
+                    "Ricardo wake word detected (probability {score:.3}): dry run, not answering"
+                );
+            } else {
+                let level_db = wake_level_db(&level_hist.values);
+                let speech_end = level_hist.speech_end(frame);
+                let endpoint_prior = endpoint_prior(&gain_hist, gain_filled);
+                let rule = wake_preroll_rule(model, shared, "ricardo");
+                let n = preroll_chunks(rule, None).min(ring.chunks());
+                let preroll = ring.last(n);
+                info!(
+                    "Ricardo wake word detected (probability {score:.3}); \
+                     wake timing: speech_end={} preroll={}",
+                    Chunks(speech_end),
+                    preroll.len() / frame
+                );
+                shared.wake_pending.fetch_add(1, Relaxed);
+                let _ = tx.send(FrontendEvent::Wake {
+                    phrase: "Рикардо".into(),
+                    level_db,
+                    preroll,
+                    endpoint_prior,
+                    event_id: wake_hit_id,
+                });
+            }
         } else if !custom_active && detecting {
             // Kept for the level window's 1.5 s, whatever the VQE chunk.
             first_stage_age = first_stage_age
@@ -984,6 +1167,7 @@ fn processing(
                         level_db,
                         preroll: preroll.clone(),
                         endpoint_prior,
+                        event_id: None,
                     });
                 }
             }
@@ -1339,7 +1523,7 @@ mod tests {
     fn without_the_yandex_library_the_handle_is_degraded() {
         // No /system/vendor/quasar/libs on the build host: dlopen fails.
         let midi = model_from_compatible(b"yandex,cucumber\0").unwrap();
-        let (h, mut rx) = spawn(midi, PathBuf::from("/nonexistent"), None, false, None);
+        let (h, mut rx) = spawn(midi, PathBuf::from("/nonexistent"), None, false, None, None);
         h.set_streaming(true);
         h.set_model(PathBuf::from("/nonexistent/2"));
         let h2 = h.clone();

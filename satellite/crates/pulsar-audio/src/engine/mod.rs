@@ -286,6 +286,7 @@ impl Engine {
         wake_dir: &Path,
         custom_wake_model: Option<&Path>,
         command_dir: Option<&Path>,
+        custom_thresholds: crate::wake_events::Thresholds,
     ) -> Option<Engine> {
         if let Err(e) = preload_deps() {
             warn!("libtflite: {e}");
@@ -324,7 +325,8 @@ impl Engine {
         };
         info!("VQE '{preset}': {chunk} input frames -> {frame} output samples per chunk");
         let custom = custom_wake_model.map(|path| match RicardoWake::new(path) {
-            Ok(detector) => {
+            Ok(mut detector) => {
+                detector.configure(custom_thresholds.cutoff, custom_thresholds.window);
                 info!("Ricardo wake word: {}", path.display());
                 Some(detector)
             }

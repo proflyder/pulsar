@@ -14,6 +14,7 @@ unsafe extern "C" {
     fn mww_destroy(handle: *mut c_void);
     fn mww_feed(handle: *mut c_void, pcm: *const i16, samples: usize, score: *mut f32) -> i32;
     fn mww_reset(handle: *mut c_void) -> i32;
+    fn mww_configure(handle: *mut c_void, cutoff: f32, window: i32);
 }
 
 /// The on-device "Рикардо" detector. Use only from the audio processing thread.
@@ -33,8 +34,20 @@ impl RicardoWake {
         Ok(Self { raw })
     }
 
-    /// Feeds one VQE chunk. Ok((true, score)) on a detection, Ok((false, _))
-    /// otherwise; Err after the detector disabled itself.
+    /// Thresholds from the model manifest: a hit needs `cutoff` as the mean of the last `window`
+    /// inference results. Call before feeding; outside cutoff in (0,1) / window 1..50 the loaded
+    /// defaults stay.
+    pub fn configure(&mut self, cutoff: f32, window: usize) {
+        let Ok(window) = i32::try_from(window) else {
+            return;
+        };
+        // SAFETY: live handle, called before any feed.
+        unsafe { mww_configure(self.raw.as_ptr(), cutoff, window) };
+    }
+
+    /// Feeds one VQE chunk. Ok((true, score)) on a detection, Ok((false, score)) otherwise, where
+    /// `score` is the windowed mean probability of this chunk (-1 while the window fills or the
+    /// 1 s warm-up runs); Err after the detector disabled itself.
     pub fn feed(&mut self, pcm: &[i16]) -> Result<(bool, f32), String> {
         let mut score = -1.0f32;
         // SAFETY: `raw` is a live handle from mww_create; `pcm` is valid for

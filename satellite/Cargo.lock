@@ -307,6 +307,7 @@ dependencies = [
  "log",
  "pulsar-alsa",
  "pulsar-core",
+ "ring",
  "tokio",
 ]
 

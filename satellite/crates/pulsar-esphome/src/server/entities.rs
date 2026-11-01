@@ -47,6 +47,10 @@ pub(super) mod key {
     pub const SELECT_CLOCK_MUSIC: u32 = 31;
     pub const SW_WAKE_PREROLL: u32 = 32;
     pub const SW_CLOCK_AUTO_BRI: u32 = 33;
+    pub const BUTTON_WAKE_FALSE_ALARM: u32 = 34;
+    pub const BUTTON_WAKE_MISSED: u32 = 35;
+    pub const SW_WAKE_EVENT_RECORDING: u32 = 36;
+    pub const SW_WAKE_DRY_RUN: u32 = 37;
 }
 
 /// aioesphomeapi VoiceAssistantFeature: voice assistant, API audio, timers, announce, start
@@ -124,6 +128,8 @@ pub(super) struct Cache {
     sw_nearest_answers: BoolState,
     sw_voice_indication: BoolState,
     sw_wake_preroll: BoolState,
+    sw_wake_event_recording: BoolState,
+    sw_wake_dry_run: BoolState,
     bs_hw_mute: BoolState,
     update: UpdateState,
     update_has: bool,
@@ -157,6 +163,8 @@ impl Cache {
             sw_nearest_answers: BoolState::default(),
             sw_voice_indication: BoolState::default(),
             sw_wake_preroll: BoolState::default(),
+            sw_wake_event_recording: BoolState::default(),
+            sw_wake_dry_run: BoolState::default(),
             bs_hw_mute: BoolState::default(),
             update: UpdateState::default(),
             update_has: false,
@@ -256,7 +264,9 @@ impl Server {
             SwitchId::Microphones
             | SwitchId::AutoUpdate
             | SwitchId::NearestAnswers
-            | SwitchId::VoiceIndication => true,
+            | SwitchId::VoiceIndication
+            | SwitchId::WakeEventRecording
+            | SwitchId::WakeDryRun => true,
         }
     }
 
@@ -346,6 +356,20 @@ impl Server {
                 cfg,
             ));
         }
+        out.push(switch(
+            "wake_event_recording",
+            key::SW_WAKE_EVENT_RECORDING,
+            "Wake: запись событий",
+            "mdi:record-circle-outline",
+            cfg,
+        ));
+        out.push(switch(
+            "wake_dry_run",
+            key::SW_WAKE_DRY_RUN,
+            "Wake: тестовый режим (без ответа)",
+            "mdi:robot-off-outline",
+            cfg,
+        ));
         let number = |oid, key, name, icon, (min, max, step): (f32, f32, f32), unit| {
             let mut w = Writer::new();
             entity_head(&mut w, oid, key, name);
@@ -466,6 +490,26 @@ impl Server {
         w.u32(7, ENTITY_CATEGORY_CONFIG, false);
         w.str(8, "restart", false);
         out.push((msg::LIST_BUTTON, w));
+        for (oid, key, name, icon) in [
+            (
+                "wake_false_alarm",
+                key::BUTTON_WAKE_FALSE_ALARM,
+                "Wake: ложное срабатывание",
+                "mdi:alert-circle-outline",
+            ),
+            (
+                "wake_missed",
+                key::BUTTON_WAKE_MISSED,
+                "Wake: не услышала",
+                "mdi:ear-hearing-off",
+            ),
+        ] {
+            let mut w = Writer::new();
+            entity_head(&mut w, oid, key, name);
+            w.str(5, icon, false);
+            w.u32(7, ENTITY_CATEGORY_CONFIG, false);
+            out.push((msg::LIST_BUTTON, w));
+        }
         let sensor = |oid, key, name, unit, class, state_class| {
             let mut w = Writer::new();
             entity_head(&mut w, oid, key, name);
@@ -731,6 +775,7 @@ impl Server {
             c.sw_wake_preroll,
             c.bs_hw_mute,
         );
+        let (wake_recording, wake_dry_run) = (c.sw_wake_event_recording, c.sw_wake_dry_run);
         let (lux, bri, scroll, speed) = (c.lux, c.clock_bri, c.clock_scroll, c.led_speed);
         self.send_media(to);
         self.send_bool(msg::SWITCH_STATE, key::SW_MICROPHONES, mic, to);
@@ -746,6 +791,13 @@ impl Server {
         if self.cfg.has_wake_preroll {
             self.send_bool(msg::SWITCH_STATE, key::SW_WAKE_PREROLL, preroll, to);
         }
+        self.send_bool(
+            msg::SWITCH_STATE,
+            key::SW_WAKE_EVENT_RECORDING,
+            wake_recording,
+            to,
+        );
+        self.send_bool(msg::SWITCH_STATE, key::SW_WAKE_DRY_RUN, wake_dry_run, to);
         self.send_update(to);
         if self.cfg.has_hw_mic_mute {
             self.send_bool(msg::BINARY_SENSOR_STATE, key::BS_HW_MIC_MUTE, hw, to);
@@ -888,6 +940,10 @@ impl Server {
                         (&mut c.sw_voice_indication, key::SW_VOICE_INDICATION)
                     }
                     SwitchId::WakePreroll => (&mut c.sw_wake_preroll, key::SW_WAKE_PREROLL),
+                    SwitchId::WakeEventRecording => {
+                        (&mut c.sw_wake_event_recording, key::SW_WAKE_EVENT_RECORDING)
+                    }
+                    SwitchId::WakeDryRun => (&mut c.sw_wake_dry_run, key::SW_WAKE_DRY_RUN),
                 };
                 *s = BoolState { has: true, v };
                 let s = *s;
