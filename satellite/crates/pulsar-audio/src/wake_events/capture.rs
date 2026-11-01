@@ -165,7 +165,8 @@ impl Capture {
                 dropped = true;
             }
             return Push {
-                hit: Some(HitInfo { id, score }),
+                // A window that could not be kept has no sidecar to write the outcome to.
+                hit: (!dropped).then_some(HitInfo { id, score }),
                 near: false,
                 finished,
                 dropped,
