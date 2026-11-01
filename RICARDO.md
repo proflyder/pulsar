@@ -83,7 +83,8 @@ merge upstream `v0.6.x` — `v0.6.1001`. Патч-номер 1000+ больше 
 2. `build.yml` на тег `v*` собирает оба бинарника, dropbear, radio и установщик, публикует
    GitHub release (`--latest`) и запускает `deploy-station.yml`.
 3. В Actions запуск деплоя ждёт одобрения в Environment `Station` (required reviewer).
-4. После одобрения job по OIDC входит в OpenBao, поднимает VPN (группа `ci`), вызывает
+4. После одобрения job поднимает VPN (группа `ci`), затем `hashicorp/vault-action` по
+   GitHub OIDC (роль `deploy-station`) читает `secret/data/ci/deploy-station` и вызывает
    `tools/ha_firmware_deploy.py --tag <tag>`: HA `homeassistant.update_entity` → сущность
    «Firmware» видит тег → `update.install` → колонка скачивает, проверяет `SHA256SUMS` и
    `--version`, меняет бинарник (старый остаётся `.prev`) и перезапускается. Скрипт ждёт
