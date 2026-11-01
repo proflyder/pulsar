@@ -25,3 +25,5 @@ led_case_color=
 clock_music=Levels
 wake_preroll=0
 clock_auto_brightness=1
+wake_event_recording=1
+wake_dry_run=0

@@ -64,6 +64,10 @@ pub struct Settings {
     pub voice_indication: bool,
     /// Audio between the end of the wake word and its confirmation goes ahead of the request.
     pub wake_preroll: bool,
+    /// Wake-event recording («Wake: запись событий»).
+    pub wake_recording: bool,
+    /// Dry run of the Ricardo detector: record, never answer («Wake: тестовый режим»).
+    pub wake_dry_run: bool,
     /// Stem of `pulsar_hw::case_colors()`, "" = none.
     pub led_case_color: String,
     /// Release being installed. Still set after a restart into another version: that release
@@ -99,6 +103,8 @@ impl Default for Settings {
             led_speed: 1.0,
             voice_indication: true,
             wake_preroll: true,
+            wake_recording: true,
+            wake_dry_run: false,
             led_case_color: String::new(),
             update_attempt: String::new(),
             zigbee_role: Mode::Off,
@@ -172,6 +178,8 @@ impl Settings {
                 }
                 b"voice_indication" => self.voice_indication = on,
                 b"wake_preroll" => self.wake_preroll = on,
+                b"wake_event_recording" => self.wake_recording = on,
+                b"wake_dry_run" => self.wake_dry_run = on,
                 b"led_case_color" => self.led_case_color = v,
                 _ => {}
             }
@@ -195,7 +203,8 @@ impl Settings {
              light_b={}\nlight_effect={}\nwake_word={}\ntz={}\nauto_update={}\nupdate_attempt={}\n\
              zigbee_role={}\nzigbee_flash_failed={:x}\nnearest_answers={}\nmusic_viz={}\n\
              led_speed={}\nvoice_indication={}\nled_case_color={}\nclock_music={}\n\
-             wake_preroll={}\nclock_auto_brightness={}\n",
+             wake_preroll={}\nclock_auto_brightness={}\nwake_event_recording={}\n\
+             wake_dry_run={}\n",
             f(self.volume),
             f(self.volume_legacy),
             b(self.muted),
@@ -223,6 +232,8 @@ impl Settings {
             self.clock_music,
             b(self.wake_preroll),
             b(self.clock_auto_brightness),
+            b(self.wake_recording),
+            b(self.wake_dry_run),
         )
     }
 

@@ -330,10 +330,23 @@ fn strtoul_hex_matches_libc() {
 fn clock_auto_brightness_is_always_written() {
     let mut s = Settings::default();
     assert!(s.clock_auto_brightness);
-    assert!(s.serialize().ends_with("clock_auto_brightness=1\n"));
+    assert!(s.serialize().contains("clock_auto_brightness=1\n"));
     s.parse(b"clock_auto_brightness=0\n");
     assert!(!s.clock_auto_brightness);
-    assert!(s.serialize().ends_with("clock_auto_brightness=0\n"));
+    assert!(s.serialize().contains("clock_auto_brightness=0\n"));
     s.parse(b"clock_auto_brightness=1\n");
     assert!(s.clock_auto_brightness);
+}
+
+#[test]
+fn wake_event_switches_round_trip() {
+    // Recording is on and dry run off by default; the `.prev` binary skips the unknown keys.
+    let s = Settings::default();
+    assert!(s.wake_recording);
+    assert!(!s.wake_dry_run);
+    let mut parsed = Settings::default();
+    parsed.parse(b"wake_event_recording=0\nwake_dry_run=1\n");
+    assert!(!parsed.wake_recording);
+    assert!(parsed.wake_dry_run);
+    assert!(parsed.serialize().ends_with("wake_dry_run=1\n"));
 }

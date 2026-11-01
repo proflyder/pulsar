@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use log::{debug, error, info, warn};
-use pulsar_audio::FrontendEvent;
+use pulsar_audio::{FrontendEvent, Outcome};
 use pulsar_core::model::Model;
 use pulsar_core::{ClockShot, Timers, UiState, now_ms};
 use pulsar_esphome::{ApiConfig, ApiEvent, ApiHandle, WakeWordInfo};
@@ -33,6 +33,8 @@ use logic::{HaTimer, Phase, RunBinding};
 const MODELS: &str = "/system/vendor/quasar/spotter_models/activation/";
 const COMMAND_MODEL: &str = "/system/vendor/quasar/spotter_models/command";
 const RICARDO_MODEL: &str = "/data/pulsar/wakewords/ru_ricardo_mww.tflite";
+/// Recorded wake events, beside `state.conf`.
+const WAKE_EVENTS_DIR: &str = "wake-events";
 const SOUNDS: &str = "/system/vendor/quasar/sounds/";
 
 /// The Ricardo installation uses the station only as an ESPHome/Sendspin endpoint;
@@ -90,6 +92,43 @@ enum Tk {
     UpdateRetry,
     /// Exit after an installed update.
     UpdateExit,
+}
+
+/// The recorded Ricardo hit behind the current dialog, or behind a pending wake arbitration.
+/// The sidecar's outcome is filled from it when the dialog ends (contract v1).
+#[derive(Clone, Debug, Default)]
+struct WakeRecord {
+    id: String,
+    /// STT_END text of the dialog; Some("") when HA recognized nothing.
+    stt: Option<String>,
+    cancelled: bool,
+    error: bool,
+    /// Another station answered this wake word.
+    arbiter_lost: bool,
+}
+
+impl WakeRecord {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            ..Self::default()
+        }
+    }
+
+    fn outcome(&self) -> Outcome {
+        if self.arbiter_lost {
+            Outcome::ArbiterLost
+        } else if self.error {
+            Outcome::Error
+        } else if self.cancelled {
+            Outcome::Cancelled
+        } else {
+            match &self.stt {
+                Some(text) if !text.is_empty() => Outcome::Answered,
+                _ => Outcome::EmptyStt,
+            }
+        }
+    }
 }
 
 /// What a `play()` was for: the C++ completion callback and the values it captured.
@@ -237,6 +276,10 @@ pub struct Controller {
     /// Last Zigbee status line published.
     zigbee_status: String,
     sendspin_pairing_prompt: bool,
+    /// The hit whose dialog is open.
+    wake_rec: Option<WakeRecord>,
+    /// The hit heard while this station arbitrates with its neighbours.
+    wake_pending: Option<WakeRecord>,
 }
 
 fn read_line(path: &str) -> String {
@@ -470,8 +513,15 @@ impl Controller {
             Some(PathBuf::from(RICARDO_MODEL)),
             custom_wake,
             Some(PathBuf::from(COMMAND_MODEL)),
+            Some(pulsar_audio::WakeEventOptions {
+                dir: logic::in_dir(&dir, WAKE_EVENTS_DIR),
+                version: VERSION.into(),
+                model: PathBuf::from(RICARDO_MODEL),
+            }),
         );
         mic.set_preroll(st.wake_preroll);
+        mic.set_wake_recording(st.wake_recording);
+        mic.set_wake_dry_run(st.wake_dry_run);
 
         let ss_cfg = SendspinConfig {
             name: id.friendly_name.clone(),
@@ -646,6 +696,8 @@ impl Controller {
             install_version: String::new(),
             zigbee_status: String::new(),
             sendspin_pairing_prompt: false,
+            wake_rec: None,
+            wake_pending: None,
         };
         // The rest of the C++ start(), in its order: every call below only queues commands to
         // the services, which run once `run` is awaited.
@@ -798,8 +850,9 @@ impl Controller {
                 level_db,
                 preroll,
                 endpoint_prior,
+                event_id,
             } => {
-                self.on_wake(&phrase, level_db, preroll, endpoint_prior);
+                self.on_wake(&phrase, level_db, preroll, endpoint_prior, event_id);
                 // After on_wake has switched streaming on where the wake word starts a request.
                 self.mic.wake_handled();
             }

@@ -14,6 +14,7 @@ use pulsar_sendspin::Transport;
 use super::logic::{self, COMMAND_AFTER_WAKE_MS, HaTimer, Phase, VoiceCommand};
 use super::{
     Controller, LISTEN_TIMEOUT_MS, PROCESS_TIMEOUT_MS, Pending, SOUNDS, TIMER_RING_MAX_MS, Tk,
+    WakeRecord,
 };
 
 impl Controller {
@@ -102,6 +103,7 @@ impl Controller {
         self.continue_conversation = false;
         self.tts_report_owed = false;
         if matches!(self.phase, Phase::Listening | Phase::Processing) {
+            self.mark_wake_cancelled();
             self.finish_interaction();
         }
     }
@@ -114,11 +116,15 @@ impl Controller {
         level_db: f32,
         preroll: Vec<i16>,
         endpoint_prior: Option<EndpointPrior>,
+        event_id: Option<String>,
     ) {
         if self.mic_muted() {
             return;
         }
         info!("wake word '{phrase}', level {level_db:.1} dB");
+        // The recorded hit this wake word belongs to (contract v1); the sidecar's outcome is
+        // filled when the dialog ends. A wake word that only stops a timer starts no dialog.
+        let rec = event_id.map(WakeRecord::new);
         if self.timer_ringing {
             // The wake word works as a stop word while ringing. A ringing station takes the
             // turn so that its neighbours do not start a dialog.
@@ -138,9 +144,10 @@ impl Controller {
         }
         // Without the HA pipeline this station could win and stay silent: it does not take part.
         if !self.arbitration_on() || !self.api.voice_subscribed() {
-            return self.answer_wake(phrase, preroll, Vec::new(), endpoint_prior);
+            return self.answer_wake(phrase, preroll, Vec::new(), endpoint_prior, rec);
         }
         self.arbitrating = true;
+        self.wake_pending = rec;
         // A station that lost the previous wake word may win this one.
         self.commands_blocked_until_ms = 0;
         self.arb_phrase = phrase.to_owned();
@@ -162,6 +169,7 @@ impl Controller {
         preroll: Vec<i16>,
         live: Vec<i16>,
         endpoint_prior: Option<EndpointPrior>,
+        rec: Option<WakeRecord>,
     ) {
         if self.timer_ringing {
             return self.stop_timer_ring();
@@ -174,11 +182,23 @@ impl Controller {
         if matches!(self.phase, Phase::Listening | Phase::Processing) {
             info!("wake word: replacing the active dialog");
             self.interrupt_speech();
+            self.mark_wake_cancelled();
             self.finish_interaction();
         } else if self.phase == Phase::Speaking || self.announcing {
+            // The cut answer's completion never closes its dialog (the id changes below), so its
+            // sidecar gets the outcome here.
+            self.mark_wake_cancelled();
+            self.finish_wake_rec();
             self.interrupt_speech(); // barge-in: cut the answer short
         }
+        self.wake_rec = rec;
         self.start_pipeline(phrase, true, preroll, live, endpoint_prior);
+        // No dialog started (HA is gone): the hit still gets an outcome instead of being
+        // overwritten by the next one.
+        if self.phase != Phase::Listening {
+            self.mark_wake_cancelled();
+            self.finish_wake_rec();
+        }
     }
 
     pub(super) fn arbitration_done(&mut self, won: bool, best: &Claim, peers: usize) {
@@ -190,6 +210,11 @@ impl Controller {
         self.arb_boundary = 0;
         let prior = self.arb_endpoint.take();
         if !won {
+            // The recorded hit still gets its outcome: another station answered.
+            if let Some(mut rec) = self.wake_pending.take() {
+                rec.arbiter_lost = true;
+                self.finish_wake(Some(rec));
+            }
             // A dialog that was already listening keeps streaming: this wake word replaced
             // nothing unless this station answers it.
             if self.phase != Phase::Listening {
@@ -211,7 +236,8 @@ impl Controller {
         // Capture keeps streaming into the new dialog: switching it off here could drop the
         // chunk between the preroll and live audio.
         let phrase = self.arb_phrase.clone();
-        self.answer_wake(&phrase, audio, live, prior);
+        let rec = self.wake_pending.take();
+        self.answer_wake(&phrase, audio, live, prior, rec);
         if self.phase != Phase::Listening {
             self.mic.set_streaming(false); // no dialog started (e.g. HA gone)
         }
@@ -220,6 +246,11 @@ impl Controller {
     pub(super) fn cancel_arbitration(&mut self) {
         if !self.arbitrating {
             return;
+        }
+        // The pending hit started no dialog: its event ended with the cancelled arbitration.
+        if let Some(mut rec) = self.wake_pending.take() {
+            rec.cancelled = true;
+            self.finish_wake(Some(rec));
         }
         self.arbiter.cancel();
         self.arbitrating = false;
@@ -361,6 +392,27 @@ impl Controller {
         self.update_ui();
     }
 
+    // ---------------- wake-event sidecars ----------------
+
+    /// The running dialog was not ended by its own run: re-wake, local cancel, mute, lost link.
+    pub(super) fn mark_wake_cancelled(&mut self) {
+        if let Some(rec) = &mut self.wake_rec {
+            rec.cancelled = true;
+        }
+    }
+
+    /// Writes the outcome of `rec` to its sidecar (no-op without a recorded hit).
+    fn finish_wake(&mut self, rec: Option<WakeRecord>) {
+        let Some(rec) = rec else { return };
+        self.mic
+            .wake_event_outcome(&rec.id, rec.outcome(), rec.stt.as_deref());
+    }
+
+    fn finish_wake_rec(&mut self) {
+        let rec = self.wake_rec.take();
+        self.finish_wake(rec);
+    }
+
     pub(super) fn on_voice_event(&mut self, ev: VaEvent, data: &HashMap<String, String>) {
         let get = |k: &str| data.get(k).map_or("", String::as_str);
         let code = ev.code();
@@ -387,7 +439,14 @@ impl Controller {
                 self.tts_played = false;
                 self.continue_conversation = false;
             }
-            VaEvent::SttVadEnd | VaEvent::SttEnd => {
+            VaEvent::SttEnd => {
+                if let Some(rec) = &mut self.wake_rec {
+                    rec.stt = Some(get("text").to_owned());
+                }
+                self.stop_streaming();
+                self.update_ui();
+            }
+            VaEvent::SttVadEnd => {
                 self.stop_streaming();
                 self.update_ui();
             }
@@ -418,14 +477,23 @@ impl Controller {
                     info!(
                         "pipeline: another satellite answers this wake word (HA duplicate wake-up)"
                     );
+                    if let Some(rec) = &mut self.wake_rec {
+                        rec.arbiter_lost = true;
+                    }
                     self.stop_streaming();
                 } else if get("code") == "stt-no-text-recognized" {
                     // Empty STT after a wake word: the user changed their mind or spoke
                     // too softly. Treat it as a silent cancel, not a station error.
                     info!("pipeline: no speech recognized, treating as cancel");
+                    if let Some(rec) = &mut self.wake_rec {
+                        rec.stt = Some(String::new());
+                    }
                     self.stop_streaming();
                 } else {
                     warn!("pipeline error: {} {}", get("code"), get("message"));
+                    if let Some(rec) = &mut self.wake_rec {
+                        rec.error = true;
+                    }
                     self.stop_streaming();
                     self.error_shown = true;
                     self.show_ui(UiState::Error);
@@ -501,6 +569,7 @@ impl Controller {
         self.tts_played = false;
         self.tts_url.clear();
         self.continue_conversation = false;
+        self.finish_wake_rec();
         self.update_duck();
         self.arm_watchdog();
         if self.error_shown {
@@ -516,6 +585,7 @@ impl Controller {
         warn!("voice pipeline: {why}");
         self.error_shown = true;
         self.show_ui(UiState::Error);
+        self.mark_wake_cancelled();
         self.finish_interaction();
     }
 
@@ -571,6 +641,7 @@ impl Controller {
     fn cancel_dialog(&mut self) {
         self.interrupt_speech();
         self.play_closing_earcon(format!("{SOUNDS}{}", self.model.cancel_sound));
+        self.mark_wake_cancelled();
         self.finish_interaction();
     }
 
@@ -583,6 +654,7 @@ impl Controller {
             return self.cancel_dialog();
         }
         if self.phase == Phase::Speaking || self.announcing {
+            self.mark_wake_cancelled();
             self.interrupt_speech();
             return self.finish_interaction();
         }
@@ -828,6 +900,7 @@ impl Controller {
                 if self.timer_ringing {
                     self.stop_timer_ring();
                 } else if self.phase == Phase::Speaking {
+                    self.mark_wake_cancelled();
                     self.interrupt_speech();
                     self.finish_interaction();
                 } else if self.announcing {
